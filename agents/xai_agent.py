@@ -15,6 +15,7 @@ from crewai import LLM
 def preprocess(raw_data_row: dict) -> np.ndarray:
     """
     Preprocesses a single raw loan application data row for model prediction.
+    Uses the unified preprocessing pipeline for consistency.
 
     Args:
         raw_data_row (dict): A dictionary representing a single new loan application,
@@ -24,77 +25,100 @@ def preprocess(raw_data_row: dict) -> np.ndarray:
         np.ndarray: A scaled numpy array of the preprocessed single data row,
                     ready for input into a trained machine learning model.
     """
-    # 1. Convert the input dictionary into a pandas DataFrame with a single row.
-    df_single = pd.DataFrame([raw_data_row])
+    try:
+        # Import the unified preprocessor
+        import sys
+        import os
+        sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+        from utils.preprocessing import preprocess_single_application
+        
+        # Use the unified preprocessing pipeline
+        processed_data = preprocess_single_application(raw_data_row, "models/preprocessor.joblib")
+        return processed_data
+        
+    except Exception as e:
+        print(f"⚠️ Warning: Unified preprocessor failed ({e}), falling back to legacy method")
+        
+        # Fallback to legacy preprocessing for backward compatibility
+        df_single = pd.DataFrame([raw_data_row])
 
-    # 2. Drop the original columns that were identified as irrelevant
-    # These include identifiers and target-related columns not present in new applications.
-    initial_irrelevant_columns = [
-        'application_id', 'applicant_name', 'email', 'mobile', 'pan',
-        'aadhaar_masked', 'borrower_data_consent_timestamp',
-        'target_approved', 'target_default_12m', 'target'
-    ]
-    df_single = df_single.drop(columns=[col for col in initial_irrelevant_columns if col in df_single.columns], errors='ignore')
+        # Drop irrelevant columns
+        initial_irrelevant_columns = [
+            'application_id', 'applicant_name', 'email', 'mobile', 'pan',
+            'aadhaar_masked', 'borrower_data_consent_timestamp',
+            'target_approved', 'target_default_12m', 'target'
+        ]
+        df_single = df_single.drop(columns=[col for col in initial_irrelevant_columns if col in df_single.columns], errors='ignore')
 
-    # 3. Convert application_date and sanction_date to datetime objects.
-    df_single['application_date'] = pd.to_datetime(df_single['application_date'])
-    df_single['sanction_date'] = pd.to_datetime(df_single['sanction_date'])
+        # Handle dates
+        if 'application_date' in df_single.columns and 'sanction_date' in df_single.columns:
+            df_single['application_date'] = pd.to_datetime(df_single['application_date'], errors='coerce')
+            df_single['sanction_date'] = pd.to_datetime(df_single['sanction_date'], errors='coerce')
+            df_single['time_to_sanction_days'] = (df_single['sanction_date'] - df_single['application_date']).dt.days
+            df_single['application_month'] = df_single['application_date'].dt.month
+        else:
+            df_single['time_to_sanction_days'] = 7  # Default
+            df_single['application_month'] = pd.Timestamp.now().month
 
-    # 4. Create new features: time_to_sanction_days and application_month.
-    df_single['time_to_sanction_days'] = (df_single['sanction_date'] - df_single['application_date']).dt.days
-    df_single['application_month'] = df_single['application_date'].dt.month
+        df_single = df_single.drop(columns=['application_date', 'sanction_date', 'state'], errors='ignore')
 
-    # 5. Drop the original application_date, sanction_date, and state columns.
-    df_single = df_single.drop(columns=['application_date', 'sanction_date', 'state'])
+        # Convert boolean columns
+        df_single['pep_flag'] = df_single['pep_flag'].astype(int)
+        df_single['kfs_provided'] = df_single['kfs_provided'].astype(int)
 
-    # 6. Convert pep_flag and kfs_provided (boolean columns) to integer type.
-    df_single['pep_flag'] = df_single['pep_flag'].astype(int)
-    df_single['kfs_provided'] = df_single['kfs_provided'].astype(int)
+        # Encode interest_type
+        df_single['interest_type_encoded'] = df_single['interest_type'].map({'Fixed': 0, 'Floating': 1}).fillna(0)
+        df_single = df_single.drop(columns=['interest_type'], errors='ignore')
 
-    # 7. Encode interest_type by mapping 'Fixed' to 0 and 'Floating' to 1,
-    # creating interest_type_encoded, then drop the original interest_type column.
-    df_single['interest_type_encoded'] = df_single['interest_type'].map({'Fixed': 0, 'Floating': 1})
-    df_single = df_single.drop(columns=['interest_type'])
+        # One-hot encode gender
+        for gender_type in ['Female', 'Male', 'Other']:
+            df_single[f'gender_{gender_type}'] = 0
+        if 'gender' in df_single.columns:
+            gender_value = df_single['gender'].iloc[0]
+            if f'gender_{gender_value}' in df_single.columns:
+                df_single[f'gender_{gender_value}'] = 1
+            df_single = df_single.drop(columns=['gender'])
 
-    # 8. One-hot encode the gender column.
-    # We explicitly create all gender columns and set the appropriate one.
-    for gender_type in ['Female', 'Male', 'Other']:
-        df_single[f'gender_{gender_type}'] = 0
-    if 'gender' in df_single.columns:
-        gender_value = df_single['gender'].iloc[0]
-        if f'gender_{gender_value}' in df_single.columns:
-            df_single[f'gender_{gender_value}'] = 1
-        df_single = df_single.drop(columns=['gender'])
+        # Create ovd_provided feature
+        df_single['ovd_provided'] = df_single['ovd_type'].notna().astype(int) if 'ovd_type' in df_single.columns else 1
 
-    # 9. Create the ovd_provided feature based on the presence of ovd_type.
-    df_single['ovd_provided'] = df_single['ovd_type'].notna().astype(int)
+        # Drop final columns
+        final_cols_to_drop = ['kyc_mode', 'ovd_type', 'loan_type']
+        df_single = df_single.drop(columns=[col for col in final_cols_to_drop if col in df_single.columns], errors='ignore')
 
-    # 10. Drop the kyc_mode, ovd_type, and loan_type columns.
-    final_cols_to_drop = ['kyc_mode', 'ovd_type', 'loan_type']
-    df_single = df_single.drop(columns=[col for col in final_cols_to_drop if col in df_single.columns], errors='ignore')
+        # Ensure feature order
+        training_features_order = ['age_years', 'pin_code', 'pep_flag', 'bureau_score',
+           'monthly_income_inr', 'existing_monthly_obligations_inr',
+           'requested_amount_inr', 'sanctioned_amount_inr', 'tenure_months',
+           'interest_rate_annual_pct', 'processing_fee_inr', 'other_charges_inr',
+           'apr_pct', 'kfs_provided', 'proposed_emi_inr',
+           'foir_total_obligations_pct', 'property_value_inr', 'ltv_ratio',
+            'time_to_sanction_days', 'application_month',
+           'interest_type_encoded', 'gender_Female', 'gender_Male', 'gender_Other',
+           'ovd_provided']
+        
+        for col in training_features_order:
+            if col not in df_single.columns:
+                df_single[col] = 0
+        df_single = df_single[training_features_order]
 
-    # 11. Ensure the processed DataFrame's columns are in the exact same order
-    # as the features (X) used during model training. Missing columns will be filled with 0.
-    training_features_order = ['age_years', 'pin_code', 'pep_flag', 'bureau_score',
-       'monthly_income_inr', 'existing_monthly_obligations_inr',
-       'requested_amount_inr', 'sanctioned_amount_inr', 'tenure_months',
-       'interest_rate_annual_pct', 'processing_fee_inr', 'other_charges_inr',
-       'apr_pct', 'kfs_provided', 'proposed_emi_inr',
-       'foir_total_obligations_pct', 'property_value_inr', 'ltv_ratio',
-        'time_to_sanction_days', 'application_month',
-       'interest_type_encoded', 'gender_Female', 'gender_Male', 'gender_Other',
-       'ovd_provided']
-    for col in training_features_order:
-        if col not in df_single.columns:
-            df_single[col] = 0
-    df_single = df_single[training_features_order]
-
-    scaler= joblib.load('models/scaler.joblib')
-    # 12. Apply the transform method to the preprocessed single row using the loaded scaler.
-    scaled_array = scaler.transform(df_single)
-
-    # 13. Return the scaled numpy array.
-    return scaled_array
+        # Apply scaling
+        try:
+            scaler_data = joblib.load('models/scaler.joblib')
+            if isinstance(scaler_data, dict) and scaler_data.get('type') == 'simple_scaler':
+                # New format: dictionary with mean and std
+                mean = np.array(scaler_data['mean'])
+                std = np.array(scaler_data['std'])
+                std[std == 0] = 1.0  # Avoid division by zero
+                scaled_array = (df_single.values - mean) / std
+            else:
+                # Old format: sklearn scaler object
+                scaled_array = scaler_data.transform(df_single)
+        except Exception as e:
+            print(f"⚠️ Warning: Could not apply scaling ({e})")
+            scaled_array = df_single.values
+            
+        return scaled_array
 
 
 def model_predict(features_array: np.array) -> np.ndarray:

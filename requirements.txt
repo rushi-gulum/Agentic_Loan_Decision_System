@@ -1,15 +1,74 @@
-numpy
-pandas
-scikit-learn
-joblib
-crewai
-crewai[tools]
-chromadb
-sentence-transformers
-pypdf
+# ==============================================================================
+# AGENTIC LOAN DECISION SYSTEM — PYTHON DEPENDENCIES
+# Forever-free cloud stack: Render + Neon + Chroma Cloud + HF Hub + Groq
+# ==============================================================================
+
+# ── Core ML & Data Processing ──────────────────────────────────────────────
+numpy>=1.24.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+joblib>=1.3.0
+
+# ── Web Framework & API ────────────────────────────────────────────────────
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.5.0
+httpx>=0.25.0
+requests>=2.31.0
+python-multipart>=0.0.6        # FastAPI file uploads
+
+# ── UI & Visualisation ─────────────────────────────────────────────────────
+streamlit>=1.28.0
+plotly>=5.17.0
+
+# ── Database — Neon.tech Serverless Postgres ───────────────────────────────
+sqlalchemy>=2.0.0              # ORM (engine, session, declarative_base)
+psycopg2-binary>=2.9.9         # Postgres driver with SSL support
+alembic>=1.13.0                # DB migrations (run: alembic upgrade head)
+
+# ── AI Agents & LLM Orchestration ─────────────────────────────────────────
+crewai>=0.83.0
+crewai[tools]>=0.83.0
+
+# ── RAG & Vector Database — Chroma Cloud ───────────────────────────────────
+chromadb>=0.5.0                # 0.5+ required for CloudClient HTTP headers
+sentence-transformers>=2.2.0
+pypdf>=3.17.0
 langchain==0.3.27
 langchain-chroma==0.2.6
 langchain-community==0.3.30
 langchain-core==0.3.78
 langchain-groq==0.3.8
 langchain-huggingface==0.3.1
+
+# ── Model Storage — Hugging Face Hub ───────────────────────────────────────
+huggingface_hub>=0.20.0        # hf_hub_download, repo uploads
+# tensorflow>=2.13.0           # Uncomment if using .h5 Keras model at inference
+
+# ── Primary LLM — Groq (Llama 3.1) ────────────────────────────────────────
+groq>=0.9.0
+
+# ── Fallback LLMs (optional) ───────────────────────────────────────────────
+openai>=1.0.0
+anthropic>=0.7.0
+
+# ── Explainable AI ─────────────────────────────────────────────────────────
+shap>=0.43.0
+lime>=0.2.0
+
+# ── Security & Environment ─────────────────────────────────────────────────
+python-dotenv>=1.0.0
+
+# ── Production Server ──────────────────────────────────────────────────────
+gunicorn>=21.0.0               # Render uses gunicorn in multi-worker mode
+
+# ── Testing ────────────────────────────────────────────────────────────────
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+
+# ── Rate Limiting ──────────────────────────────────────────────────────────
+slowapi>=0.1.9
+
+# ── Monitoring (optional) ──────────────────────────────────────────────────
+# sentry-sdk[fastapi]>=1.40.0
+# python-json-logger>=2.0.0

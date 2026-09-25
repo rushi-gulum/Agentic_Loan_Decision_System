@@ -1,0 +1,58 @@
+name: Deploy Agentic Loan Decision System
+
+on:
+  push:
+    branches: [ main, production ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        
+    - name: Run tests
+      run: |
+        python -m pytest tests/test_rule_engine.py tests/test_risk_agent.py -v
+        
+    - name: Test API health
+      run: |
+        python -c "from utils.config import config; print('Config OK')"
+        python -c "from utils.llm_utility_cloud import check_llm_health; print('LLM OK')"
+
+  deploy-api:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Deploy to Render
+      uses: johnbeynon/render-deploy-action@v0.0.8
+      with:
+        service-id: ${{ secrets.RENDER_SERVICE_ID }}
+        api-key: ${{ secrets.RENDER_API_KEY }}
+
+  deploy-frontend:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Trigger Streamlit Cloud Deploy
+      run: |
+        echo "Streamlit Community Cloud will auto-deploy from main branch"
+        # Streamlit Cloud automatically deploys on push to main
