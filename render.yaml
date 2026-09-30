@@ -1,46 +1,56 @@
 # Render.com Deployment Configuration
-# FastAPI Backend + Uvicorn for FREE tier deployment
+# FastAPI Backend on Python 3.11
 
 services:
-  # FastAPI Backend Service
   - type: web
     name: loan-decision-api
-    env: python
+    runtime: python
     region: oregon
     plan: free
+    # Pin to Python 3.11 (crewai requires <=3.13; runtime.txt also sets this)
+    pythonVersion: "3.11"
     buildCommand: |
       pip install --upgrade pip
       pip install -r requirements.txt
-      python pipeline/build_artifacts.py
-      python pipeline/ingest_rag.py
-    startCommand: |
-      uvicorn api.app:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn api.app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
     envVars:
       - key: ENVIRONMENT
         value: production
-      - key: LOG_LEVEL  
+      - key: LOG_LEVEL
         value: INFO
       - key: DEBUG
-        value: false
+        value: "false"
+      - key: PYTHON_VERSION
+        value: "3.11"
+      # Secrets — set these in the Render dashboard, NOT here
       - key: GROQ_API_KEY
-        sync: false  # Set in Render dashboard
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: CHROMA_CLOUD_API_KEY
+        sync: false
+      - key: CHROMA_CLOUD_TENANT
+        sync: false
+      - key: CHROMA_CLOUD_DATABASE
+        value: rbi_guidelines
+      - key: HUGGINGFACE_REPO_ID
+        sync: false
+      - key: HUGGINGFACE_API_TOKEN
+        sync: false
       - key: SECRET_KEY
         generateValue: true
       - key: ALLOWED_HOSTS
         value: loan-decision-api.onrender.com,localhost
       - key: CORS_ORIGINS
-        value: https://your-streamlit-app.streamlit.app
+        value: https://your-app.streamlit.app,http://localhost:8501
       - key: CHROMA_PERSIST_DIRECTORY
-        value: /opt/render/project/src/chroma_db
+        value: /opt/render/project/src/data/embeddings
       - key: MODEL_CACHE_DIR
         value: /opt/render/project/src/models
       - key: DATA_CACHE_DIR
         value: /opt/render/project/src/data
-
-  # Background Services (Optional - for cron jobs)
-  # - type: cron
-  #   name: model-updater
-  #   env: python
-  #   schedule: "0 2 * * *"  # Daily at 2 AM
-  #   buildCommand: pip install -r requirements.txt
-  #   startCommand: python scripts/update_models.py
+      - key: GROQ_MODEL
+        value: qwen/qwen3.8-27b
+      - key: ANONYMIZED_TELEMETRY
+        value: "false"
