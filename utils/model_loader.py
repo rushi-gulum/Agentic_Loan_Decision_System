@@ -43,9 +43,11 @@ EXPLAINER_DIR = MODEL_DIR / "explainer"
 ARTEFACT_MANIFEST = [
     ("preprocessor.joblib",              MODEL_DIR / "preprocessor.joblib",              True),
     ("scaler.joblib",                    MODEL_DIR / "scaler.joblib",                    True),
+    ("loan_approval_model.joblib",       MODEL_DIR / "loan_approval_model.joblib",       True),   # sklearn LR (primary)
     ("explainer/shap_explainer.joblib",  EXPLAINER_DIR / "shap_explainer.joblib",        True),
     ("explainer/lime_explainer.joblib",  EXPLAINER_DIR / "lime_explainer.joblib",        True),
-    ("loan_approval_model.h5",           MODEL_DIR / "loan_approval_model.h5",           False),  # large optional
+    ("loan_approval_model_xgb.joblib",   MODEL_DIR / "loan_approval_model_xgb.joblib",  False),  # optional XGB
+    ("loan_approval_model.h5",           MODEL_DIR / "loan_approval_model.h5",           False),  # optional legacy Keras
 ]
 
 # ---------------------------------------------------------------------------
@@ -199,14 +201,62 @@ def load_shap_explainer():
 
 
 def load_lime_explainer():
-    """Load the LIME explainer. Downloads from HF if missing."""
+    """
+    Load the LIME explainer manifest and reconstruct a LimeTabularExplainer.
+    The manifest is a plain dict (no unpicklable lambdas), so it survives
+    joblib round-trips on all platforms.
+    """
     path = EXPLAINER_DIR / "lime_explainer.joblib"
     if not path.exists():
         download_models()
     if not path.exists():
         raise FileNotFoundError(f"lime_explainer.joblib not found at {path}.")
+
+    import joblib, numpy as np
+    from lime.lime_tabular import LimeTabularExplainer
+
+    data = joblib.load(path)
+
+    # If already a LimeTabularExplainer (legacy), return as-is
+    if isinstance(data, LimeTabularExplainer):
+        return data
+
+    # Reconstruct from manifest dict
+    return LimeTabularExplainer(
+        training_data         = np.array(data["training_data"]),
+        feature_names         = data["feature_names"],
+        class_names           = data.get("class_names", ["Rejected", "Approved"]),
+        mode                  = data.get("mode", "classification"),
+        discretize_continuous = data.get("discretize_continuous", True),
+        random_state          = data.get("random_state", 42),
+    )
+
+
+def load_approval_model():
+    """
+    Load the fitted sklearn classification model.
+    Prefers loan_approval_model.joblib (sklearn LR).
+    Falls back to loan_approval_model_xgb.joblib if available.
+    Raises FileNotFoundError if neither is present.
+    """
     import joblib
-    return joblib.load(path)
+    primary  = MODEL_DIR / "loan_approval_model.joblib"
+    fallback = MODEL_DIR / "loan_approval_model_xgb.joblib"
+
+    for path in (primary, fallback):
+        if path.exists():
+            logger.info("Loading model from %s", path)
+            return joblib.load(path), path.name
+
+    # Try downloading
+    download_models()
+    for path in (primary, fallback):
+        if path.exists():
+            return joblib.load(path), path.name
+
+    raise FileNotFoundError(
+        "No sklearn model found. Run: python pipeline/build_artifacts.py"
+    )
 
 
 def check_model_health() -> dict:

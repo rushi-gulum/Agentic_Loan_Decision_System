@@ -171,55 +171,123 @@ async def root():
 @app.get("/health", tags=["Meta"])
 async def health_check(request: Request) -> Dict[str, Any]:
     """
-    Comprehensive health check used by Render's health-check probe,
-    Streamlit dashboard, and CI smoke tests.
+    Health check anchored to the actual /evaluate dependency chain.
 
-    Returns HTTP 200 if all required components are healthy.
-    Returns HTTP 503 if any required component is degraded.
+    A component is "healthy" only if it can fulfil its role in
+    evaluate_application(). The overall status is HTTP 200 only when
+    every REQUIRED component is healthy; otherwise HTTP 503.
+
+    Required for /evaluate:
+      - models       : preprocessor.joblib + loan_approval_model.joblib +
+                       shap_explainer.joblib + lime_explainer.joblib
+      - database     : Neon Postgres (audit log)
+      - llm          : Groq (or MockLLM fallback)
+
+    Optional (degrades gracefully):
+      - vector_store : Chroma Cloud / local (RAG soft compliance)
     """
-    # Models
-    model_health = getattr(request.app.state, "model_health", {"status": "unknown"})
 
-    # Database
-    db_status = getattr(request.app.state, "db_status", "unknown")
+    # ── 1. Models — check the artefacts /evaluate actually loads ─────────
+    try:
+        from utils.model_loader import check_model_health
+        mh = check_model_health()
+
+        # Determine which required artefacts are missing
+        required_keys = [
+            "preprocessor.joblib",
+            "loan_approval_model.joblib",
+            "explainer/shap_explainer.joblib",
+            "explainer/lime_explainer.joblib",
+        ]
+        missing = [
+            k for k in required_keys
+            if not mh.get("artefacts", {}).get(k, {}).get("present", False)
+        ]
+
+        if missing:
+            model_health = {
+                "status":  "degraded",
+                "missing": missing,
+                "detail":  "Run: python pipeline/build_artifacts.py",
+            }
+        else:
+            model_health = {
+                "status":   "healthy",
+                "artefacts": {
+                    k: mh["artefacts"][k]
+                    for k in required_keys
+                    if k in mh.get("artefacts", {})
+                },
+                "hf_repo":  mh.get("hf_repo", "local"),
+            }
+    except Exception as exc:
+        model_health = {"status": "error", "error": str(exc)}
+
+    # ── 2. Database ───────────────────────────────────────────────────────
     try:
         from utils.db_utils import SessionLocal, get_decision_stats
-        db = SessionLocal()
-        stats = get_decision_stats(db)
-        db.close()
-        db_health = {"status": "healthy", "stats": stats}
+        _db = SessionLocal()
+        stats = get_decision_stats(_db)
+        _db.close()
+        db_health = {
+            "status": "healthy",
+            "backend": "neon" if "neon.tech" in os.getenv("DATABASE_URL", "") else "sqlite",
+            "stats":   stats,
+        }
     except Exception as exc:
         db_health = {"status": "error", "error": str(exc)}
 
-    # Vector store
-    rag_health = getattr(request.app.state, "rag_health", {"status": "unknown"})
-
-    # LLM
+    # ── 3. LLM — test a real Groq call ───────────────────────────────────
     try:
-        from utils.llm_utility_cloud import check_llm_health
-        llm_health = check_llm_health()
+        from utils.llm_utility import get_llm, TaskType
+        _llm = get_llm(TaskType.FAST)
+        _resp = _llm.invoke("Reply with one word: HEALTHY")
+        _text = _resp.content if hasattr(_resp, "content") else str(_resp)
+        provider = "groq" if os.getenv("GROQ_API_KEY") else "mock"
+        llm_health = {
+            "status":    "healthy",
+            "provider":  provider,
+            "model":     os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b"),
+            "ping":      _text.strip()[:40],
+        }
     except Exception as exc:
-        llm_health = {"status": "error", "error": str(exc)}
+        llm_health = {"status": "error", "provider": "unknown", "error": str(exc)}
 
+    # ── 4. Vector store — optional, degrades gracefully ──────────────────
+    try:
+        from agents.rag_agent import check_rag_health
+        rag_health = check_rag_health()
+    except Exception as exc:
+        rag_health = {"status": "degraded", "error": str(exc)}
+
+    # ── Aggregate ─────────────────────────────────────────────────────────
     components = {
-        "models":      model_health,
-        "database":    db_health,
-        "vector_store": rag_health,
-        "llm":         llm_health,
+        "models":       model_health,
+        "database":     db_health,
+        "llm":          llm_health,
+        "vector_store": rag_health,   # optional — does NOT gate overall status
     }
 
-    # Overall: healthy only if every required component is healthy
     required_ok = all(
         components[c].get("status") == "healthy"
         for c in ("models", "database", "llm")
     )
     overall = "healthy" if required_ok else "degraded"
 
+    # Identify what's broken for operator visibility
+    issues = [
+        f"{c}: {components[c].get('error', components[c].get('missing', components[c].get('detail', '')))}"
+        for c in ("models", "database", "llm")
+        if components[c].get("status") != "healthy"
+    ]
+
     payload = {
         "status":      overall,
         "version":     "2.0.0",
         "environment": os.getenv("ENVIRONMENT", "development"),
+        "evaluate_ready": required_ok,
         "components":  components,
+        "issues":      issues if issues else None,
     }
     return JSONResponse(content=payload, status_code=200 if required_ok else 503)
 
@@ -230,8 +298,8 @@ async def detailed_status() -> Dict[str, Any]:
     return {
         "environment":       os.getenv("ENVIRONMENT", "development"),
         "llm_provider":      "groq" if os.getenv("GROQ_API_KEY") else "mock",
-        "groq_model":        os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
-        "database_backend":  "neon" if (os.getenv("DATABASE_URL", "").startswith("postgresql")) else "sqlite",
+        "groq_model":        os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b"),
+        "database_backend":  "neon" if os.getenv("DATABASE_URL", "").startswith("postgresql") else "sqlite",
         "vector_db_backend": "cloud" if os.getenv("CHROMA_CLOUD_API_KEY") else "local",
         "model_storage":     "huggingface" if os.getenv("HUGGINGFACE_REPO_ID") else "local",
         "cors_origins":      _parse_cors_origins(),

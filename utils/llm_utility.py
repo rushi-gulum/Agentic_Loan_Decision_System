@@ -193,11 +193,9 @@ def create_groq_llm(task_type: TaskType, **kwargs) -> Any:
         if not api_key:
             raise ValueError("GROQ_API_KEY not found")
         
-        # Task-specific model selection
-        if task_type == TaskType.SMART:
-            model = "llama-3.1-70b-versatile"  # Larger model for complex reasoning
-        else:
-            model = "llama-3.1-8b-instant"    # Fast model for quick tasks
+        # qwen3.8-27b is verified available on this account (2026-09-23)
+        # Use for both FAST and SMART — it handles both use cases well
+        model = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
         
         return ChatGroq(
             model=model,
@@ -297,7 +295,7 @@ def get_crewai_llm(task_type: TaskType = TaskType.GENERAL, **kwargs) -> Any:
         provider = get_llm_provider()
         
         if provider == LLMProvider.GROQ:
-            model_name = "llama-3.1-8b-instant" if task_type == TaskType.FAST else "llama-3.1-70b-versatile"
+            model_name = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
             return CrewAI_LLM(
                 model=f"groq/{model_name}",
                 temperature=kwargs.get("temperature", 0.2),

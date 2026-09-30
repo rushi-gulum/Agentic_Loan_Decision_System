@@ -44,17 +44,27 @@ make test              # 28 unit tests (28/28 passing)
 ## 🏗️ Architecture Highlights
 
 ### Short-Circuit Guardrail Pattern
-Hard regulatory constraints are evaluated **first** before expensive ML inference:
-- ❌ **PEP flagged applicants** → Immediate rejection
-- ❌ **FOIR > 75%** → Immediate rejection  
-- ❌ **Missing KYC documents** → Immediate rejection
-- ✅ **Only compliant applications** → Proceed to ML models
+Hard regulatory constraints are evaluated **first**, using the raw application dict, before expensive ML inference:
+- ❌ **Bureau score below minimum** → Immediate rejection (sub-100ms)
+- ❌ **FOIR > product limit** → Immediate rejection
+- ❌ **PEP flag + unresolved EDD** → Escalation
+- ✅ **All hard rules pass** → Proceed to RAG + ML pipeline
 
 ### Hybrid Policy Engine
-Combines **deterministic rules** with **RAG-powered compliance** for bulletproof regulatory adherence:
-- **Phase 1**: Hard constraints (mathematical rules)
-- **Phase 2**: RAG retrieval from RBI guidelines for edge cases
-- **Phase 3**: LLM reasoning for complex regulatory scenarios
+Phase 1 (hard): Deterministic math from `rules/rule_base.yaml` — cannot hallucinate.
+Phase 2 (soft): Groq-powered RAG retrieval from 1,708 RBI guideline chunks in Chroma Cloud.
+
+### Actual Model Stack
+| Layer | Implementation | File |
+|---|---|---|
+| Preprocessing | sklearn Pipeline (fitted) | `models/preprocessor.joblib` |
+| Classification | LogisticRegression (84% accuracy) | `models/loan_approval_model.joblib` |
+| Explainability | Coefficient-based SHAP + LIME TabularExplainer | `models/explainer/` |
+| LLM | Groq `qwen/qwen3.8-27b` (primary) → OpenAI → MockLLM | `utils/llm_utility.py` |
+| Vector DB | Chroma Cloud (1,708 RBI chunks) → local fallback | `agents/rag_agent.py` |
+| Audit DB | Neon.tech Postgres (pg8000 driver) → SQLite fallback | `utils/db_utils.py` |
+
+> Note: The repository previously referenced XGBoost and Keras/TensorFlow models. The current production pipeline uses **sklearn LogisticRegression** for full interpretability, cross-platform compatibility, and deterministic output. XGBoost support is available if `pip install xgboost` is run before `build_artifacts.py`.
 
 ## 🧠 System Overview  
 This system implements a **production-grade loan approval pipeline** that combines:

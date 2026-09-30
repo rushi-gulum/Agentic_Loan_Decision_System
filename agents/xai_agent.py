@@ -1,395 +1,351 @@
+"""
+agents/xai_agent.py
+===================
+Explainable AI agent for the Agentic Loan Decision System.
 
+What it does
+------------
+1. Loads the sklearn loan approval model  (loan_approval_model.joblib)
+2. Runs SHAP LinearExplainer to get feature attributions
+3. Runs LIME TabularExplainer for instance-level explanation
+4. Uses Groq (via get_llm) to generate human-readable summaries
+   — customer-facing paragraph
+   — regulator-facing structured report
 
-from openai import OpenAI
-import shap
-from tensorflow.keras.models import load_model
+All LLM calls go through utils/llm_utility.get_llm() — Groq-primary,
+never direct OpenAI() instantiation.
+
+The .h5 Keras model is NOT required. The pipeline uses sklearn models
+produced by pipeline/build_artifacts.py.
+"""
+
+import os
+import sys
+import json
+import logging
 import numpy as np
 import pandas as pd
-import joblib
-import json
-from lime.lime_tabular import LimeTabularExplainer
-import os
-from crewai import LLM
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+from utils.llm_utility import get_llm, TaskType
+
+logger = logging.getLogger(__name__)
+
+# ── Paths ─────────────────────────────────────────────────────────────────
+_MODEL_PATH       = "models/loan_approval_model.joblib"
+_SHAP_PATH        = "models/explainer/shap_explainer.joblib"
+_LIME_PATH        = "models/explainer/lime_explainer.joblib"
+_PREPROCESSOR_PATH= "models/preprocessor.joblib"
+_X_TRAIN_PATH     = "data/processed/X_train.csv"
+
+# ── Module-level cache so we only load once per process ───────────────────
+_model            = None
+_shap_explainer   = None
+_lime_explainer   = None
+_feature_names    = None
 
 
-def preprocess(raw_data_row: dict) -> np.ndarray:
+# ─────────────────────────────────────────────────────────────────────────
+# Loader helpers
+# ─────────────────────────────────────────────────────────────────────────
+
+def _load_artefacts():
+    """Lazy-load all ML artefacts. Raises FileNotFoundError with clear message."""
+    global _model, _shap_explainer, _lime_explainer, _feature_names
+
+    if _model is not None:
+        return  # already loaded
+
+    import joblib
+    from utils.model_loader import load_approval_model, load_shap_explainer, load_lime_explainer
+
+    _model, model_name = load_approval_model()
+    logger.info("Loaded model: %s", model_name)
+
+    _shap_explainer = load_shap_explainer()
+    _lime_explainer = load_lime_explainer()
+
+    # Feature names — prefer X_train.csv header, fall back to SHAP's stored names
+    if os.path.exists(_X_TRAIN_PATH):
+        _feature_names = list(pd.read_csv(_X_TRAIN_PATH, nrows=0).columns)
+    elif hasattr(_shap_explainer, "feature_names") and _shap_explainer.feature_names is not None:
+        _feature_names = list(_shap_explainer.feature_names)
+    else:
+        _feature_names = [f"feature_{i}" for i in range(25)]
+
+    logger.info("Artefacts ready — %d features", len(_feature_names))
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Preprocessing helper (used by orchestrator and standalone tests)
+# ─────────────────────────────────────────────────────────────────────────
+
+def preprocess(raw_data: dict) -> np.ndarray:
     """
-    Preprocesses a single raw loan application data row for model prediction.
-    Uses the unified preprocessing pipeline for consistency.
-
-    Args:
-        raw_data_row (dict): A dictionary representing a single new loan application,
-                             containing all original features.
-
-    Returns:
-        np.ndarray: A scaled numpy array of the preprocessed single data row,
-                    ready for input into a trained machine learning model.
+    Preprocess a raw application dict into a (1, n_features) numpy array.
+    Uses the unified LoanPreprocessor first; falls back to a simple
+    column-alignment approach if the preprocessor is unavailable.
     """
     try:
-        # Import the unified preprocessor
-        import sys
-        import os
-        sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
         from utils.preprocessing import preprocess_single_application
-        
-        # Use the unified preprocessing pipeline
-        processed_data = preprocess_single_application(raw_data_row, "models/preprocessor.joblib")
-        return processed_data
-        
-    except Exception as e:
-        print(f"⚠️ Warning: Unified preprocessor failed ({e}), falling back to legacy method")
-        
-        # Fallback to legacy preprocessing for backward compatibility
-        df_single = pd.DataFrame([raw_data_row])
-
-        # Drop irrelevant columns
-        initial_irrelevant_columns = [
-            'application_id', 'applicant_name', 'email', 'mobile', 'pan',
-            'aadhaar_masked', 'borrower_data_consent_timestamp',
-            'target_approved', 'target_default_12m', 'target'
-        ]
-        df_single = df_single.drop(columns=[col for col in initial_irrelevant_columns if col in df_single.columns], errors='ignore')
-
-        # Handle dates
-        if 'application_date' in df_single.columns and 'sanction_date' in df_single.columns:
-            df_single['application_date'] = pd.to_datetime(df_single['application_date'], errors='coerce')
-            df_single['sanction_date'] = pd.to_datetime(df_single['sanction_date'], errors='coerce')
-            df_single['time_to_sanction_days'] = (df_single['sanction_date'] - df_single['application_date']).dt.days
-            df_single['application_month'] = df_single['application_date'].dt.month
-        else:
-            df_single['time_to_sanction_days'] = 7  # Default
-            df_single['application_month'] = pd.Timestamp.now().month
-
-        df_single = df_single.drop(columns=['application_date', 'sanction_date', 'state'], errors='ignore')
-
-        # Convert boolean columns
-        df_single['pep_flag'] = df_single['pep_flag'].astype(int)
-        df_single['kfs_provided'] = df_single['kfs_provided'].astype(int)
-
-        # Encode interest_type
-        df_single['interest_type_encoded'] = df_single['interest_type'].map({'Fixed': 0, 'Floating': 1}).fillna(0)
-        df_single = df_single.drop(columns=['interest_type'], errors='ignore')
-
-        # One-hot encode gender
-        for gender_type in ['Female', 'Male', 'Other']:
-            df_single[f'gender_{gender_type}'] = 0
-        if 'gender' in df_single.columns:
-            gender_value = df_single['gender'].iloc[0]
-            if f'gender_{gender_value}' in df_single.columns:
-                df_single[f'gender_{gender_value}'] = 1
-            df_single = df_single.drop(columns=['gender'])
-
-        # Create ovd_provided feature
-        df_single['ovd_provided'] = df_single['ovd_type'].notna().astype(int) if 'ovd_type' in df_single.columns else 1
-
-        # Drop final columns
-        final_cols_to_drop = ['kyc_mode', 'ovd_type', 'loan_type']
-        df_single = df_single.drop(columns=[col for col in final_cols_to_drop if col in df_single.columns], errors='ignore')
-
-        # Ensure feature order
-        training_features_order = ['age_years', 'pin_code', 'pep_flag', 'bureau_score',
-           'monthly_income_inr', 'existing_monthly_obligations_inr',
-           'requested_amount_inr', 'sanctioned_amount_inr', 'tenure_months',
-           'interest_rate_annual_pct', 'processing_fee_inr', 'other_charges_inr',
-           'apr_pct', 'kfs_provided', 'proposed_emi_inr',
-           'foir_total_obligations_pct', 'property_value_inr', 'ltv_ratio',
-            'time_to_sanction_days', 'application_month',
-           'interest_type_encoded', 'gender_Female', 'gender_Male', 'gender_Other',
-           'ovd_provided']
-        
-        for col in training_features_order:
-            if col not in df_single.columns:
-                df_single[col] = 0
-        df_single = df_single[training_features_order]
-
-        # Apply scaling
-        try:
-            scaler_data = joblib.load('models/scaler.joblib')
-            if isinstance(scaler_data, dict) and scaler_data.get('type') == 'simple_scaler':
-                # New format: dictionary with mean and std
-                mean = np.array(scaler_data['mean'])
-                std = np.array(scaler_data['std'])
-                std[std == 0] = 1.0  # Avoid division by zero
-                scaled_array = (df_single.values - mean) / std
-            else:
-                # Old format: sklearn scaler object
-                scaled_array = scaler_data.transform(df_single)
-        except Exception as e:
-            print(f"⚠️ Warning: Could not apply scaling ({e})")
-            scaled_array = df_single.values
-            
-        return scaled_array
+        return preprocess_single_application(raw_data, _PREPROCESSOR_PATH)
+    except Exception as exc:
+        logger.warning("Unified preprocessor failed (%s), using fallback", exc)
+        return _fallback_preprocess(raw_data)
 
 
-def model_predict(features_array: np.array) -> np.ndarray:
-    """
-    Dummy function to represent model training.
-    In practice, this would involve fitting a machine learning model.
+def _fallback_preprocess(raw: dict) -> np.ndarray:
+    """Minimal feature alignment when preprocessor is unavailable."""
+    COLS = [
+        "age_years", "pin_code", "pep_flag", "bureau_score",
+        "monthly_income_inr", "existing_monthly_obligations_inr",
+        "requested_amount_inr", "sanctioned_amount_inr", "tenure_months",
+        "interest_rate_annual_pct", "processing_fee_inr", "other_charges_inr",
+        "apr_pct", "kfs_provided", "proposed_emi_inr",
+        "foir_total_obligations_pct", "property_value_inr", "ltv_ratio",
+        "time_to_sanction_days", "application_month",
+        "interest_type_encoded", "gender_Female", "gender_Male", "gender_Other",
+        "ovd_provided",
+    ]
+    row = {c: 0 for c in COLS}
+    row.update({k: v for k, v in raw.items() if k in COLS})
+    row["pep_flag"]  = int(bool(row.get("pep_flag", False)))
+    row["kfs_provided"] = int(bool(row.get("kfs_provided", True)))
+    return np.array([[row[c] for c in COLS]], dtype=np.float32)
 
-    Args:
-        features_array (np.ndarray): Preprocessed scaled feature array for training.
 
-    Returns:
-        np.ndarray: Dummy return value.
-    """
-
-    # Load the saved Keras model
-    loaded_model = load_model('models/loan_approval_model.h5')
-    print("Keras model 'loan_approval_model.h5' loaded successfully.")
-    
-    prediction_probability = loaded_model.predict(features_array)[0][0]
-
-    return prediction_probability
+def model_predict(features: np.ndarray) -> float:
+    """Return P(approved) for a preprocessed feature array."""
+    _load_artefacts()
+    proba = _model.predict_proba(features)
+    return float(proba[0, 1])
 
 
-MODEL_PATH = "models/loan_approval_model.h5"
-SHAP_EXPLAINER_PATH = "models/explainer/shap_explainer.joblib"
-LIME_EXPLAINER_PATH = "models/explainer/lime_explainer.joblib"
-
-# ---------------------------------------------------------------------
-# 🔍 LOADERS
-# ---------------------------------------------------------------------
-def _load_model_and_explainers():
-    """Load model, SHAP, and LIME explainers from disk."""
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"Model not found at {MODEL_PATH}")
-
-    # 1️⃣ Load Keras model
-    model = load_model(MODEL_PATH)
-    print("✅ Model loaded successfully.")
-
-    # 2️⃣ Load X_train for background + feature reference
-    try:
-        x_train = pd.read_csv('data/processed/X_train.csv')
-        feature_names = x_train.columns.tolist()
-    except Exception as e:
-        raise FileNotFoundError("❌ Failed to load training data for explainers.") from e
-
-    # 3️⃣ Sample background for SHAP
-    background_data = x_train.sample(n=min(100, len(x_train)), random_state=42)
-    background_array = background_data.values.astype(np.float32)
-
-    # 4️⃣ Initialize SHAP safely
-    shap_explainer = None
-    try:
-        shap_explainer = shap.Explainer(model, background_array, feature_names=feature_names)
-        print("✅ SHAP universal Explainer initialized successfully.")
-    except Exception as e:
-        print(f"⚠️ shap.Explainer failed ({e}), falling back to KernelExplainer.")
-        def predict_fn(x):
-            preds = model.predict(x)
-            if preds.ndim == 1 or preds.shape[1] == 1:
-                preds = np.hstack([1 - preds, preds])
-            return preds
-        shap_explainer = shap.KernelExplainer(predict_fn, background_array[:50])
-        shap_explainer.feature_names = feature_names
-        print("✅ SHAP KernelExplainer fallback initialized successfully.")
-
-    # 5️⃣ Initialize LIME
-    lime_explainer = LimeTabularExplainer(
-        training_data=x_train.values,
-        feature_names=feature_names,
-        class_names=["Rejected", "Approved"],
-        mode="classification",
-        discretize_continuous=True
-    )
-    print("✅ LIME TabularExplainer initialized successfully.")
-
-    return model, shap_explainer, lime_explainer
+# ─────────────────────────────────────────────────────────────────────────
+# Core explanation function
+# ─────────────────────────────────────────────────────────────────────────
 
 def explain_prediction(
     features_array: np.ndarray,
     applicant_data: dict,
     compliance_data: dict,
     risk_data: dict,
-    model_name: str = "Credit Risk Classifier",
+    model_name: str = "LoanApprovalClassifier",
 ) -> dict:
     """
-    Generate two-tiered explanations for a loan decision using SHAP, LIME, and LLM.
+    Generate SHAP + LIME explanations and Groq-powered summaries.
 
-    Args:
-        features_array (np.ndarray): Scaled applicant features.
-        applicant_data (dict): Raw applicant input.
-        compliance_data (dict): ComplianceAgent outputs.
-        risk_data (dict): RiskAgent outputs.
-        model_name (str): Model used for prediction.
+    Parameters
+    ----------
+    features_array : preprocessed (1, n) array
+    applicant_data : raw applicant dict
+    compliance_data: output of compliance agent
+    risk_data      : output of risk agent
+    model_name     : label for reports
 
-    Returns:
-        dict: {
-          "user_explanation": str,
-          "regulator_explanation": str,
-          "raw_data": {...}
+    Returns
+    -------
+    {
+      "user_explanation":      str,
+      "regulator_explanation": str,
+      "raw_data":              dict,
+    }
+    """
+    _load_artefacts()
+
+    # ── Prediction ────────────────────────────────────────────────────────
+    proba    = _model.predict_proba(features_array)
+    p_approve= float(proba[0, 1])
+    decision = "approved" if p_approve >= 0.5 else "rejected"
+
+    # ── SHAP ──────────────────────────────────────────────────────────────
+    shap_values = _shap_explainer.shap_values(features_array)
+
+    # LinearExplainer returns 1-D; CoeffExplainer returns list of lists
+    if isinstance(shap_values, list):
+        if len(shap_values) > 0 and isinstance(shap_values[0], list):
+            sv_arr = np.array(shap_values[0])       # CoeffExplainer: [[vals]]
+        else:
+            sv_arr = np.array(shap_values)          # Linear single-output
+    else:
+        sv_arr = np.array(shap_values)
+    sv_arr = sv_arr.flatten()
+    feat_names = _feature_names[:len(sv_arr)]
+
+    # Top 10 features by absolute impact
+    top_idx   = np.argsort(np.abs(sv_arr))[::-1][:10]
+    top_shap  = [
+        {
+            "feature": feat_names[i],
+            "shap_value": round(float(sv_arr[i]), 4),
+            "direction": "positive" if sv_arr[i] > 0 else "negative",
         }
-    """
+        for i in top_idx
+    ]
 
-    # Load model + explainers
-    model, shap_explainer, lime_explainer = _load_model_and_explainers()
+    # ── LIME ──────────────────────────────────────────────────────────────
+    def _predict_fn(arr):
+        return _model.predict_proba(arr)
 
-    # Run prediction
-    prediction = model.predict(features_array)[0]
-    pred_proba = np.hstack([1 - prediction, prediction])
-    decision = "approved" if prediction == 1 else "rejected"
+    try:
+        lime_exp   = _lime_explainer.explain_instance(
+            features_array[0].astype(float),
+            _predict_fn,
+            num_features=10,
+        )
+        lime_list  = lime_exp.as_list()
+    except Exception as exc:
+        logger.warning("LIME explanation failed: %s", exc)
+        lime_list  = []
 
-    # -----------------------------------------------------------------
-    # 🟦 SHAP Explanation
-    # -----------------------------------------------------------------
-    shap_exp = shap_explainer.shap_values(features_array)
-    shap_values = shap_exp[1] if isinstance(shap_exp, list) else shap_exp
-    feature_names = shap_explainer.feature_names
-    top_shap_features = feature_names[:10]
-    # -----------------------------------------------------------------
-    # 🟩 LIME Explanation
-    # -----------------------------------------------------------------
-    def predict_fn(x):
-        preds = model.predict(x)
-        if preds.ndim == 1 or preds.shape[1] == 1:
-            preds = np.hstack([1 - preds, preds])
-        return preds
-
-    lime_exp = lime_explainer.explain_instance(
-        features_array[0],
-        predict_fn,
-        num_features=25
-    )
-
-    lime_explanation = lime_exp.as_list()
-
-    # -----------------------------------------------------------------
-    # 🧾 Combine Raw Explanation Data
-    # -----------------------------------------------------------------
-    raw_explanation_data = {
-        "decision": decision,
-        "prediction_probability": {
-            "approved": float(pred_proba[1]),
-            "rejected": float(pred_proba[0]),
-        },
-        "model_used": model_name,
-        "applicant_data": applicant_data,
-        "compliance_data": compliance_data,
-        "risk_data": risk_data,
-        "explainability": {
-            "top_shap_features": top_shap_features,
-            "lime_explanation": lime_explanation,
-        },
+    # ── Build raw data block ───────────────────────────────────────────────
+    raw_data = {
+        "decision":             decision,
+        "p_approve":            round(p_approve, 4),
+        "p_reject":             round(1 - p_approve, 4),
+        "model_used":           model_name,
+        "shap_top_features":    top_shap,
+        "lime_explanation":     lime_list,
+        "risk_drivers":         risk_data.get("drivers", []),
+        "compliance_summary":   compliance_data.get("explanation", ""),
     }
 
-    # -----------------------------------------------------------------
-    # 🤖 LLM Summarization (Readable Reports)
-    # -----------------------------------------------------------------
-    llm = LLM(
-    model="openai/gpt-4o",
-    temperature=0.2,
-    max_tokens=6000,
-    base_url="https://api.openai.com/v1",
-)
+    # ── LLM summaries ─────────────────────────────────────────────────────
+    user_text   = _generate_user_explanation(decision, applicant_data, top_shap, p_approve)
+    reg_text    = _generate_regulator_explanation(decision, applicant_data, raw_data,
+                                                   compliance_data, risk_data)
 
-    # User Explanation Prompt
-    user_prompt = f"""
-    You are a loan officer. Based on this decision data:
-    Decision: {decision}
-    Model: {model_name}
-    Top SHAP features: {top_shap_features}
-    LIME explanation: {lime_explanation}
-
-    Write a short, easy-to-understand paragraph (3–5 sentences)
-    explaining why the loan was {decision}. Use plain language suitable
-    for the applicant (non-technical). Mention positive and negative factors.
-    """
-    client = OpenAI()
-    user_explanation = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "user", "content": user_prompt}
-        ],
-        
-        temperature=0.2,
-    ).choices[0].message.content
-
-    # Regulator Explanation Prompt
-    regulator_prompt = f"""
-    You are a financial auditor preparing a compliance-friendly report.
-    Using the following data, produce a detailed, structured summary.
-
-    Decision: {decision}
-    Model Used: {model_name}
-    Prediction Probabilities: {pred_proba.tolist()}
-    Applicant Data: {json.dumps(applicant_data, indent=2)}
-    Compliance Data: {json.dumps(compliance_data, indent=2)}
-    Risk Data: {json.dumps(risk_data, indent=2)}
-    Top SHAP Features: {top_shap_features}
-    LIME Explanation: {lime_explanation}
-
-    Generate a 2-part report:
-    1. Executive Summary (2–3 short paragraphs)
-    2. Technical Appendix (include feature impacts, risk assessment, and compliance checks)
-
-    The tone should be professional and clear, suitable for regulatory review.
-    """
-
-    regulator_explanation = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "user", "content": regulator_prompt}
-        ],
-        temperature=0.2,
-    ).choices[0].message.content
-    # ------------------------------------------------------
-    # ✅ Final Output
-    # -----------------------------------------------------------------
     return {
-        "user_explanation": user_explanation,
-        "regulator_explanation": regulator_explanation,
-        "raw_data": raw_explanation_data,
+        "user_explanation":      user_text,
+        "regulator_explanation": reg_text,
+        "raw_data":              raw_data,
     }
 
+
+# ─────────────────────────────────────────────────────────────────────────
+# LLM explanation generators (Groq via get_llm)
+# ─────────────────────────────────────────────────────────────────────────
+
+def _generate_user_explanation(
+    decision:      str,
+    applicant:     dict,
+    top_shap:      list,
+    p_approve:     float,
+) -> str:
+    """Customer-facing explanation in plain English."""
+    try:
+        llm = get_llm(TaskType.FAST)   # Groq fast model
+
+        # Summarise top positive and negative factors
+        pos = [f["feature"] for f in top_shap if f["direction"] == "positive"][:3]
+        neg = [f["feature"] for f in top_shap if f["direction"] == "negative"][:3]
+
+        prompt = f"""You are a friendly loan officer explaining a decision.
+
+Loan type : {applicant.get('loan_type', 'loan')}
+Bureau score: {applicant.get('bureau_score', 'N/A')}
+FOIR       : {applicant.get('foir_total_obligations_pct', 'N/A')}%
+Decision   : {decision.upper()}  (approval probability {p_approve:.0%})
+Top supporting factors : {', '.join(pos) or 'none'}
+Top risk factors       : {', '.join(neg) or 'none'}
+
+Write 3-5 plain-English sentences explaining the {decision} decision.
+Mention actual numbers. Be empathetic and constructive. No markdown."""
+
+        raw = llm.invoke(prompt)
+        return (raw.content if hasattr(raw, "content") else str(raw)).strip()
+
+    except Exception as exc:
+        logger.warning("User explanation LLM failed: %s", exc)
+        return (
+            f"Your {applicant.get('loan_type','loan')} application has been {decision}. "
+            f"Key factors include your bureau score of {applicant.get('bureau_score','N/A')} "
+            f"and FOIR of {applicant.get('foir_total_obligations_pct','N/A')}%."
+        )
+
+
+def _generate_regulator_explanation(
+    decision:    str,
+    applicant:   dict,
+    raw_data:    dict,
+    compliance:  dict,
+    risk:        dict,
+) -> str:
+    """Structured regulatory audit report."""
+    try:
+        llm = get_llm(TaskType.SMART)
+
+        prompt = f"""You are a financial auditor preparing a regulatory compliance report.
+
+Decision        : {decision.upper()}
+Approval P      : {raw_data['p_approve']:.4f}
+Model used      : {raw_data['model_used']}
+Compliance score: {compliance.get('compliance_score', 0):.2f}
+Hard violations : {len(compliance.get('hard_violations', []))}
+Soft violations : {len(compliance.get('soft_violations', []))}
+Risk grade      : {risk.get('grade', 'N/A')}  (score {risk.get('risk_score_10', 'N/A')}/10)
+Risk drivers    : {risk.get('drivers', [])}
+Top SHAP        : {json.dumps(raw_data['shap_top_features'][:5], indent=2)}
+
+Write a 2-section regulatory report:
+Section 1 — Executive Summary (2 short paragraphs)
+Section 2 — Technical Appendix (feature impacts, risk assessment, compliance checks)
+Tone: professional, precise, suitable for RBI regulatory review. No markdown headers."""
+
+        raw = llm.invoke(prompt)
+        return (raw.content if hasattr(raw, "content") else str(raw)).strip()
+
+    except Exception as exc:
+        logger.warning("Regulator explanation LLM failed: %s", exc)
+        return (
+            f"AUTOMATED DECISION REPORT — {decision.upper()}\n"
+            f"Model: {raw_data.get('model_used', 'N/A')} | "
+            f"P(approve)={raw_data.get('p_approve', 0):.4f} | "
+            f"Risk grade: {risk.get('grade', 'N/A')} | "
+            f"Compliance score: {compliance.get('compliance_score', 0):.2f}\n"
+            f"Risk drivers: {risk.get('drivers', [])}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# CLI smoke test
+# ─────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    sample_new_application_data = {
-        'application_id': 'app_987654321',
-        'application_date': '2023-05-10',
-        'sanction_date': '2023-05-18',
-        'loan_type': 'Personal Loan',
-        'applicant_name': 'Jane Doe',
-        'age_years': 42,
-        'gender': 'Female',
-        'state': 'Delhi',
-        'pin_code': 110001,
-        'email': 'jane.doe@example.com',
-        'mobile': 9988776655,
-        'pan': 'FGHIJ5678K',
-        'aadhaar_masked': 'XXXX XXXX 5678',
-        'kyc_mode': 'Offline',
-        'ovd_type': 'Driving Licence',
-        'pep_flag': False,
-        'bureau_score': 710,
-        'monthly_income_inr': 90000,
-        'existing_monthly_obligations_inr': 25000,
-        'requested_amount_inr': 2500000,
-        'sanctioned_amount_inr': 2300000,
-        'tenure_months': 180,
-        'interest_type': 'Floating',
-        'interest_rate_annual_pct': 9.8,
-        'processing_fee_inr': 25000.0,
-        'other_charges_inr': 1000.0,
-        'apr_pct': 10.1,
-        'kfs_provided': True,
-        'borrower_data_consent_timestamp': '2023-05-10 09:30:00',
-        'proposed_emi_inr': 28000.0,
-        'foir_total_obligations_pct': 0.45,
-        'property_value_inr': 3000000,
-        'ltv_ratio': 0.75,
-        'target_approved': 1, # These targets would not be available for actual new data
-        'target_default_12m': 0,
-    }
+    logging.basicConfig(level=logging.INFO)
 
-    # Preprocess the sample data
-    preprocessed_sample = preprocess(sample_new_application_data)
-    applicant_data = {
-        "loan_type": "housing loan",
+    sample = {
+        "application_id": "TEST-001",
+        "loan_type": "housing",
+        "age_years": 35,
+        "gender": "Male",
         "bureau_score": 720,
-        "monthly_income_inr": 55000,
+        "monthly_income_inr": 80_000,
+        "existing_monthly_obligations_inr": 15_000,
+        "requested_amount_inr": 2_500_000,
+        "sanctioned_amount_inr": 2_500_000,
+        "tenure_months": 240,
+        "interest_rate_annual_pct": 9.0,
+        "processing_fee_inr": 25_000,
+        "other_charges_inr": 1_000,
+        "apr_pct": 9.5,
+        "kfs_provided": True,
+        "proposed_emi_inr": 22_000,
+        "foir_total_obligations_pct": 46.25,
+        "property_value_inr": 3_500_000,
+        "ltv_ratio": 0.71,
+        "pep_flag": False,
     }
-    compliance_data = {"rbi_rules_followed": True, "violations": []}
-    risk_data = {"risk_score": 0.23, "risk_category": "Low"}
 
-    output = explain_prediction(preprocessed_sample, applicant_data, compliance_data, risk_data)
-    print(output)
+    arr = preprocess(sample)
+    print("Preprocessed shape:", arr.shape)
+
+    result = explain_prediction(
+        arr, sample,
+        compliance_data={"compliance_score": 0.9, "hard_violations": [],
+                         "soft_violations": [], "explanation": "All checks passed."},
+        risk_data={"risk_score_10": 3.5, "grade": "A", "drivers": ["bureau_score", "foir"]},
+    )
+    print("Decision:", result["raw_data"]["decision"])
+    print("P(approve):", result["raw_data"]["p_approve"])
+    print("\nUser explanation:\n", result["user_explanation"][:300])

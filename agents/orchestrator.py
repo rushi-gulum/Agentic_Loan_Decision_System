@@ -1,815 +1,498 @@
-# agents/orchestrator.py
 """
-Production Agentic Loan Decision Orchestrator
+agents/orchestrator.py
+======================
+LoanDecisionOrchestrator — single authoritative execution path.
 
-Phase 3 Updates:
-- LoanDecisionOrchestrator class with short-circuit pattern
-- Unified preprocessing integration (Phase 1)
-- Hybrid compliance engine integration (Phase 2)
-- Async-friendly evaluation pipeline
-- Structured response format for FastAPI
+5-stage pipeline (short-circuit pattern):
+  1. Preprocess         utils/preprocessing.py
+  2. Hard compliance    rules/rule_engine.py          (deterministic, no LLM)
+  3. Soft compliance    agents/compliance_agent.py    (RAG + Groq)
+  4. Risk assessment    agents/risk_agent.py          (deterministic math)
+  5. Decision + XAI     agents/decision_agent.py      (Groq via get_crewai_llm)
+                        agents/xai_agent.py           (SHAP/LIME + Groq)
 
-Architecture:
-1. Preprocess application data with unified pipeline
-2. Hard compliance checks (short-circuit on violations)
-3. LLM soft compliance evaluation
-4. Risk assessment
-5. Final decision with explainability
-6. Structured response formatting
+LLM provider: ALL agent LLM calls go through utils/llm_utility.get_crewai_llm()
+              which routes Groq → OpenAI → MockLLM in priority order.
+              No direct OpenAI() instantiation anywhere in this file.
 """
 
 import os
 import sys
 import json
 import logging
-from typing import Any, Dict, Optional
 from datetime import datetime
+from typing import Any, Dict, List, Optional
 
-# Ensure local imports work
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from pydantic import BaseModel, Field
-from crewai import Crew, Agent, Task, LLM
-from crewai.tools import tool
+from dotenv import load_dotenv
+load_dotenv(override=True)
 
-# Phase 1 & 2 Components
+# ── Core pipeline imports ─────────────────────────────────────────────────
 from utils.preprocessing import preprocess_single_application
 from rules.rule_engine import evaluate_hard_constraints
-from agents.compliance_agent import evaluate_hard_compliance, evaluate_soft_compliance
-from agents.xai_agent import preprocess, model_predict, explain_prediction
-from agents.rag_agent import retrieve_feature_guidelines
+from agents.compliance_agent import check_rbi_compliance
 from agents.risk_agent import compute_risk_score
-from utils.llm_utility import get_llm, TaskType
+from agents.rag_agent import retrieve_feature_guidelines
 
-# Import schemas for response formatting
-from api.schemas import (
-    FinalDecisionResponse, RiskAssessment, ComplianceResult, 
-    XAIReport, DecisionSummary
-)
+# ── Unified LLM (Groq-primary, no hard-coded provider) ───────────────────
+from utils.llm_utility import get_crewai_llm, get_llm, TaskType
 
 logger = logging.getLogger(__name__)
 
+
 class LoanDecisionOrchestrator:
     """
-    Production orchestrator for loan decision pipeline
-    
-    Features:
-    - Short-circuit pattern (fail fast on hard violations)
-    - Unified preprocessing integration
-    - Hybrid compliance checking
-    - Structured response formatting
-    - Error handling and logging
+    Authoritative orchestrator for the loan decision pipeline.
+
+    Every public method is synchronous; the API layer wraps calls in
+    asyncio.run_in_executor so FastAPI stays non-blocking.
     """
-    
+
     def __init__(self):
-        """Initialize orchestrator with agents and components"""
-        self._initialize_llm()
-        self._initialize_crew_agents()
-        
-    def _initialize_llm(self):
-        """Initialize LLM with proper configuration"""
-        self.llm = LLM(
-            model="openai/gpt-4o",
-            temperature=0.2,
-            max_tokens=6000,
-            base_url="https://api.openai.com/v1",
-        )
-        
-    def _initialize_crew_agents(self):
-        """Initialize CrewAI agents for decision pipeline"""
-        # Risk Agent
-        self.risk_agent = Agent(
-            name="RiskAgent",
-            role="Risk Scoring Analyst",
-            goal="Compute comprehensive risk assessment with explanations",
-            backstory="Expert credit risk analyst providing quantitative assessments",
-            tools=[risk_scorer_tool],
-            verbose=False,
-            max_iter=2,
-            llm=self.llm,
-            allow_delegation=False
-        )
-        
-        # Decision Agent
-        self.decision_agent = Agent(
-            name="DecisionAgent",
-            role="Final Loan Decision Maker",
-            goal="Make final loan approval decision based on compliance and risk",
-            backstory="Senior credit officer ensuring regulatory compliance",
-            tools=[decision_evaluator_tool],
-            verbose=False,
-            max_iter=2,
-            llm=self.llm,
-            allow_delegation=False
-        )
-        
-        # XAI Agent
-        self.xai_agent = Agent(
-            name="XAIAgent", 
-            role="Explainable AI Officer",
-            goal="Generate comprehensive explanations for decisions",
-            backstory="AI ethics officer ensuring transparency and explainability",
-            tools=[xai_reporter_tool],
-            verbose=False,
-            max_iter=2,
-            llm=self.llm,
-            allow_delegation=False
-        )
-    
+        """
+        Lazy-initialise: heavy components (CrewAI agents, explainer) are
+        created on first use so the import itself is cheap.
+        """
+        self._crewai_llm: Optional[Any]  = None   # initialised lazily
+        self._xai_ready:  bool           = False
+        logger.info("LoanDecisionOrchestrator created (lazy init)")
+
+    # ── Lazy LLM accessor ────────────────────────────────────────────────
+
+    def _get_llm(self):
+        """Return a CrewAI-compatible LLM routed through unified utility."""
+        if self._crewai_llm is None:
+            self._crewai_llm = get_crewai_llm(TaskType.SMART)
+            logger.info("LLM initialised: %s", type(self._crewai_llm).__name__)
+        return self._crewai_llm
+
+    # ── Public entry point ────────────────────────────────────────────────
+
     def evaluate_application(self, application_data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Main evaluation pipeline with short-circuit pattern
-        
-        Args:
-            application_data: Raw application data
-            
-        Returns:
-            Structured decision response compatible with FinalDecisionResponse
+        Execute the full 5-stage evaluation pipeline.
+
+        Returns a dict that is schema-compatible with FinalDecisionResponse.
+        Guaranteed to return *something* — never raises to the caller.
         """
         start_time = datetime.utcnow()
-        
+        application_id = application_data.get("application_id", "UNKNOWN")
+
         try:
-            # Step 1: Preprocess application (Phase 1)
-            logger.info("Step 1: Preprocessing application data")
-            preprocessed_data = preprocess_single_application(application_data)
-            
-            # Step 2: Hard compliance checks (Phase 2 - Short Circuit)
-            logger.info("Step 2: Running hard compliance checks")
-            hard_violations = evaluate_hard_constraints(preprocessed_data, application_data.get('loan_type', 'personal'))
-            
-            if not hard_violations.is_compliant:
-                logger.info("Hard violations detected - short-circuiting")
-                return self._create_rejection_response(
-                    reason="Hard compliance violations detected",
-                    violations=hard_violations["violations"],
-                    processing_time_ms=self._get_processing_time(start_time)
+            # ── Stage 1: Preprocess ──────────────────────────────────────
+            logger.info("[%s] Stage 1: Preprocessing", application_id)
+            preprocessed = preprocess_single_application(application_data)
+
+            # ── Stage 2: Hard compliance (deterministic, short-circuit) ──
+            logger.info("[%s] Stage 2: Hard compliance", application_id)
+            loan_type    = str(application_data.get("loan_type", "personal")).lower()
+            # Rule engine needs the ORIGINAL dict (feature values), not the preprocessed array
+            hard_result  = evaluate_hard_constraints(application_data, loan_type)
+
+            if not hard_result.is_compliant:
+                logger.info("[%s] SHORT-CIRCUIT: %d hard violations",
+                            application_id, len(hard_result.violations))
+                return self._rejection_response(
+                    application_id = application_id,
+                    violations     = [v.model_dump() for v in hard_result.violations],
+                    rules_applied  = hard_result.rules_applied,
+                    processing_ms  = self._elapsed_ms(start_time),
                 )
-            
-            # Step 3: Soft compliance evaluation (Phase 2)
-            logger.info("Step 3: Running soft compliance evaluation")
-            compliance_result = self.compliance_agent.evaluate_compliance(
-                preprocessed_data, application_data
+
+            # ── Stage 3: Soft compliance (RAG + Groq) ────────────────────
+            logger.info("[%s] Stage 3: Soft compliance", application_id)
+            try:
+                guidelines      = retrieve_feature_guidelines(application_data)
+                compliance_dict = check_rbi_compliance(preprocessed, guidelines)
+            except Exception as exc:
+                logger.warning("[%s] Soft compliance error (non-fatal): %s", application_id, exc)
+                compliance_dict = self._compliance_pass_fallback(hard_result)
+
+            # ── Stage 4: Risk assessment (pure math, no LLM) ─────────────
+            logger.info("[%s] Stage 4: Risk assessment", application_id)
+            risk_dict = compute_risk_score(application_data)
+
+            # ── Stage 5: Decision + XAI ───────────────────────────────────
+            logger.info("[%s] Stage 5: Decision + XAI", application_id)
+            decision_dict = self._make_decision(compliance_dict, risk_dict, application_id)
+            xai_dict      = self._generate_xai(preprocessed, application_data,
+                                               compliance_dict, risk_dict, decision_dict,
+                                               application_id)
+
+            return self._build_response(
+                application_id  = application_id,
+                compliance_dict = compliance_dict,
+                risk_dict       = risk_dict,
+                decision_dict   = decision_dict,
+                xai_dict        = xai_dict,
+                processing_ms   = self._elapsed_ms(start_time),
             )
-            
-            # Step 4: Risk assessment
-            logger.info("Step 4: Computing risk assessment")
-            risk_result = self._compute_risk_assessment(preprocessed_data)
-            
-            # Step 5: Final decision
-            logger.info("Step 5: Making final decision")
-            decision_result = self._make_final_decision(
-                compliance_result, risk_result, preprocessed_data
-            )
-            
-            # Step 6: Generate explanations
-            logger.info("Step 6: Generating explanations")
-            xai_result = self._generate_explanations(
-                preprocessed_data, compliance_result, risk_result, decision_result
-            )
-            
-            # Step 7: Format response
-            return self._format_final_response(
-                compliance_result=compliance_result,
-                risk_result=risk_result, 
-                decision_result=decision_result,
-                xai_result=xai_result,
-                processing_time_ms=self._get_processing_time(start_time)
-            )
-            
-        except Exception as e:
-            logger.error(f"Orchestration failed: {str(e)}")
-            return self._create_error_response(
-                str(e), self._get_processing_time(start_time)
-            )
-    
-    def _compute_risk_assessment(self, preprocessed_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Compute risk assessment using risk agent"""
-        try:
-            risk_task = Task(
-                description="Compute comprehensive risk score using Risk Scorer tool",
-                expected_output="JSON with risk_score_10, grade, and components",
-                agent=self.risk_agent
-            )
-            
-            crew = Crew(
-                agents=[self.risk_agent],
-                tasks=[risk_task],
-                verbose=False
-            )
-            
-            result = crew.kickoff(inputs={"applicant": preprocessed_data})
-            
-            # Parse result if it's a string
-            if isinstance(result, str):
-                try:
-                    result = json.loads(result)
-                except json.JSONDecodeError:
-                    result = {"risk_score_10": 5.0, "grade": "MEDIUM", "error": "Parse failed"}
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Risk assessment failed: {str(e)}")
-            return {
-                "risk_score_10": 5.0,
-                "grade": "UNKNOWN",
-                "error": str(e)
-            }
-    
-    def _make_final_decision(
-        self, 
-        compliance_result: Dict[str, Any], 
-        risk_result: Dict[str, Any],
-        preprocessed_data: Dict[str, Any]
+
+        except Exception as exc:
+            logger.error("[%s] Orchestration error: %s", application_id, exc, exc_info=True)
+            return self._error_response(application_id, str(exc), self._elapsed_ms(start_time))
+
+    # ── Stage 5a: Decision ────────────────────────────────────────────────
+
+    def _make_decision(
+        self,
+        compliance: Dict[str, Any],
+        risk:       Dict[str, Any],
+        app_id:     str,
     ) -> Dict[str, Any]:
-        """Make final loan decision"""
-        try:
-            decision_task = Task(
-                description="Make final loan decision based on compliance and risk",
-                expected_output="JSON with loan_eligible, decision_reason, selected_model",
-                agent=self.decision_agent
-            )
-            
-            crew = Crew(
-                agents=[self.decision_agent],
-                tasks=[decision_task],
-                verbose=False
-            )
-            
-            result = crew.kickoff(inputs={
-                "policy_output": compliance_result,
-                "risk_output": risk_result
-            })
-            
-            if isinstance(result, str):
-                try:
-                    result = json.loads(result)
-                except json.JSONDecodeError:
-                    result = {
-                        "loan_eligible": False,
-                        "decision_reason": "Decision parsing failed",
-                        "selected_model": "none"
-                    }
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"Final decision failed: {str(e)}")
+        """
+        Use Groq (via get_llm) to determine final eligibility and model selection.
+        Falls back to rule-based decision if LLM is unavailable.
+        """
+        risk_score = float(risk.get("risk_score_10", 5.0))
+        is_compliant = compliance.get("is_compliant", False)
+
+        # Rule-based fast-path when LLM unavailable or for very clear cases
+        if not is_compliant:
             return {
                 "loan_eligible": False,
-                "decision_reason": f"Decision error: {str(e)}",
-                "selected_model": "none"
+                "decision_reason": "Soft compliance issues detected by RAG/LLM review.",
+                "selected_model": "none",
+                "approval_probability": 0.05,
             }
-    
-    def _generate_explanations(
-        self,
-        preprocessed_data: Dict[str, Any],
-        compliance_result: Dict[str, Any],
-        risk_result: Dict[str, Any], 
-        decision_result: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Generate XAI explanations"""
+
         try:
-            xai_task = Task(
-                description="Generate comprehensive explanations for loan decision",
-                expected_output="JSON with user_explanation and regulator_explanation",
-                agent=self.xai_agent
-            )
-            
-            crew = Crew(
-                agents=[self.xai_agent],
-                tasks=[xai_task],
-                verbose=False
-            )
-            
-            result = crew.kickoff(inputs={
-                "applicant": preprocessed_data,
-                "risk_output": risk_result,
-                "compliance_output": compliance_result,
-                "decision_output": decision_result
-            })
-            
-            if isinstance(result, str):
-                try:
-                    result = json.loads(result)
-                except json.JSONDecodeError:
-                    result = {
-                        "user_explanation": "Decision explanation unavailable",
-                        "regulator_explanation": "Technical explanation unavailable"
-                    }
-            
-            return result
-            
-        except Exception as e:
-            logger.error(f"XAI generation failed: {str(e)}")
-            return {
-                "user_explanation": f"Explanation error: {str(e)}",
-                "regulator_explanation": f"Technical error: {str(e)}"
-            }
-    
-    def _format_final_response(
-        self,
-        compliance_result: Dict[str, Any],
-        risk_result: Dict[str, Any],
-        decision_result: Dict[str, Any],
-        xai_result: Dict[str, Any],
-        processing_time_ms: int
-    ) -> Dict[str, Any]:
-        """Format response for FinalDecisionResponse schema"""
-        
-        # Determine overall decision
-        decision = "APPROVED" if decision_result.get("loan_eligible", False) else "REJECTED"
-        
-        return {
-            "application_id": "TBD",  # Will be set by API layer
-            "decision": decision,
-            "confidence_score": self._calculate_confidence(compliance_result, risk_result),
-            "processing_time_ms": processing_time_ms,
-            
-            # Risk Assessment
-            "risk_assessment": {
-                "score": risk_result.get("risk_score_10", 0.0),
-                "grade": risk_result.get("grade", "UNKNOWN"),
-                "factors": risk_result.get("drivers", []),
-                "details": risk_result.get("components", {})
-            },
-            
-            # Compliance Result
-            "compliance": {
-                "overall_status": compliance_result.get("final_verdict", "INCOMPLETE"),
-                "score": compliance_result.get("compliance_score", 0.0),
-                "violations": compliance_result.get("violations", []),
-                "checks_performed": len(compliance_result.get("feature_compliance", {}))
-            },
-            
-            # XAI Report
-            "explanations": {
-                "user_friendly": xai_result.get("user_explanation", "No explanation available"),
-                "technical": xai_result.get("regulator_explanation", "No technical details available"),
-                "key_factors": self._extract_key_factors(risk_result, compliance_result),
-                "model_used": decision_result.get("selected_model", "none")
-            },
-            
-            # Decision Summary
-            "summary": {
-                "primary_reason": decision_result.get("decision_reason", "No reason provided"),
-                "recommendation": "APPROVE" if decision == "APPROVED" else "REJECT",
-                "next_steps": self._get_next_steps(decision, compliance_result, risk_result)
-            }
-        }
-    
-    def _create_rejection_response(
-        self, 
-        reason: str, 
-        violations: list,
-        processing_time_ms: int
-    ) -> Dict[str, Any]:
-        """Create rejection response for hard violations"""
-        return {
-            "application_id": "TBD",
-            "decision": "REJECTED",
-            "confidence_score": 0.95,  # High confidence in hard rejections
-            "processing_time_ms": processing_time_ms,
-            
-            "risk_assessment": {
-                "score": 10.0,  # Max risk for hard violations
-                "grade": "HIGH",
-                "factors": ["Hard compliance violations"],
-                "details": {}
-            },
-            
-            "compliance": {
-                "overall_status": "FAIL",
-                "score": 0.0,
-                "violations": violations,
-                "checks_performed": len(violations)
-            },
-            
-            "explanations": {
-                "user_friendly": f"Application rejected due to: {reason}",
-                "technical": f"Hard rule violations detected: {violations}",
-                "key_factors": violations,
-                "model_used": "rule_engine"
-            },
-            
-            "summary": {
-                "primary_reason": reason,
-                "recommendation": "REJECT",
-                "next_steps": ["Address compliance violations", "Resubmit application"]
-            }
-        }
-    
-    def _create_error_response(self, error: str, processing_time_ms: int) -> Dict[str, Any]:
-        """Create error response"""
-        return {
-            "application_id": "TBD",
-            "decision": "ERROR",
-            "confidence_score": 0.0,
-            "processing_time_ms": processing_time_ms,
-            
-            "risk_assessment": {
-                "score": 0.0,
-                "grade": "UNKNOWN",
-                "factors": ["Processing error"],
-                "details": {"error": error}
-            },
-            
-            "compliance": {
-                "overall_status": "INCOMPLETE",
-                "score": 0.0,
-                "violations": [],
-                "checks_performed": 0
-            },
-            
-            "explanations": {
-                "user_friendly": "Unable to process application due to system error",
-                "technical": f"Processing error: {error}",
-                "key_factors": ["System error"],
-                "model_used": "none"
-            },
-            
-            "summary": {
-                "primary_reason": f"System error: {error}",
-                "recommendation": "RETRY",
-                "next_steps": ["Contact support", "Retry submission"]
-            }
-        }
-    
-    def _calculate_confidence(
-        self, 
-        compliance_result: Dict[str, Any], 
-        risk_result: Dict[str, Any]
-    ) -> float:
-        """Calculate decision confidence score"""
-        compliance_score = compliance_result.get("compliance_score", 0.5)
-        risk_score = risk_result.get("risk_score_10", 5.0)
-        
-        # Higher confidence for extreme cases
-        if compliance_score < 0.3 or risk_score > 8:
-            return 0.9  # High confidence rejection
-        elif compliance_score > 0.8 and risk_score < 3:
-            return 0.9  # High confidence approval
-        else:
-            return 0.7  # Moderate confidence
-    
-    def _extract_key_factors(
-        self,
-        risk_result: Dict[str, Any],
-        compliance_result: Dict[str, Any]
-    ) -> list:
-        """Extract key decision factors"""
-        factors = []
-        
-        # Risk factors
-        factors.extend(risk_result.get("drivers", []))
-        
-        # Compliance factors
-        violations = compliance_result.get("violations", [])
-        factors.extend([v.get("description", "Unknown violation") for v in violations])
-        
-        return factors[:5]  # Top 5 factors
-    
-    def _get_next_steps(
-        self,
-        decision: str,
-        compliance_result: Dict[str, Any],
-        risk_result: Dict[str, Any]
-    ) -> list:
-        """Get recommended next steps"""
-        if decision == "APPROVED":
-            return [
-                "Proceed with loan documentation",
-                "Schedule property verification",
-                "Complete final approval process"
-            ]
-        else:
-            steps = ["Address identified issues"]
-            
-            if compliance_result.get("violations"):
-                steps.append("Resolve compliance violations")
-            
-            if risk_result.get("risk_score_10", 0) > 7:
-                steps.append("Improve risk profile")
-            
-            steps.append("Resubmit application")
-            return steps
-    
-    def _get_processing_time(self, start_time: datetime) -> int:
-        """Calculate processing time in milliseconds"""
-        return int((datetime.utcnow() - start_time).total_seconds() * 1000)
+            llm = get_llm(TaskType.SMART)
+            prompt = f"""You are an RBI-regulated credit decision officer.
 
-# -----------------------------------------------------------------------------
-# TOOLS (keep existing for compatibility)
-# -----------------------------------------------------------------------------
+PolicyAgent Output:
+{json.dumps(compliance, indent=2, default=str)}
 
-# Keep existing tool definitions for CrewAI compatibility
-class RAGInput(BaseModel):
-    applicant_raw: Dict[str, Any] = Field(..., description="Applicant JSON used to determine loan type and query policy.")
-
-class RiskInput(BaseModel):
-    applicant: Dict[str, Any] = Field(..., description="Applicant JSON for risk scoring.")
-
-# -----------------------------------------------------------------------------
-# TOOLS
-# -----------------------------------------------------------------------------
-# ...existing code...
-# ...existing code...
-
-
-# ---------------- TOOL 3 ----------------
-@tool("XAI Reporter")
-def xai_reporter_tool(applicant_data: dict,
-                      compliance_data: dict,
-                      risk_data: dict) -> dict:
-    """
-    Generates user and regulator-friendly explanations for a loan decision
-    using LLM summarization of SHAP & LIME insights.
-    """
-    preprocessed = preprocess(applicant_data)
-    output = explain_prediction(preprocessed, applicant_data, compliance_data, risk_data)
-    return output
-
-
-@tool("RBI Guideline Retriever")
-def rag_agent_tool(applicant_raw: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Retrieve RBI rules for the applicant's all features(for example "age_years", "monthly_income_inr", "foir_total_obligations_pct",
-        "ltv_ratio", "pep_flag", "interest_type", "loan_type") from Chroma DB.
-    Instrumented: prints entry/exit and returns 'error' on failure so orchestrator can surface issues.
-    """
-    print("[RAG TOOL] invoked with applicant_raw keys:", list(applicant_raw.keys()) if isinstance(applicant_raw, dict) else type(applicant_raw))
-    try:
-        res = retrieve_feature_guidelines(applicant_raw)
-        out = {
-            "loan_type": res.get("loan_type"),
-            # The 'feature_guidelines' key is mandatory for the next agent to use the data
-            "feature_guidelines": res.get("feature_guidelines", {}) 
-        }
-
-        print(f"[RAG TOOL] output: {out['feature_guidelines'].keys()}")
-
-        # Assuming we can determine the total number of retrieved chunks from the nested dict for printing:
-        total_chunks = sum(len(d.get("retrieved_guidelines", [])) for d in out["feature_guidelines"].values())
-        
-        print(f"[RAG TOOL] success — retrieved {total_chunks} total guideline chunks across features")
-
-        return out
-    except FileNotFoundError as fnf:
-        msg = str(fnf)
-        print("[RAG TOOL] FileNotFoundError:", msg)
-        return {"loan_type": None, "query": "", "retrieved_guidelines": [], "error": msg}
-    except ValueError as ve:
-        msg = str(ve)
-        print("[RAG TOOL] ValueError:", msg)
-        return {"loan_type": None, "query": "", "retrieved_guidelines": [], "error": msg}
-    except Exception as e:
-        msg = repr(e)
-        print("[RAG TOOL] Exception:", msg)
-        return {"loan_type": None, "query": "", "retrieved_guidelines": [], "error": msg}
-
-
-@tool("Risk Scorer")
-def risk_scorer_tool(applicant: dict[str, Any])-> Dict[str, Any]:
-    """
-    Compute explainable risk score (0–10, higher = riskier) for an application.
-    Output includes: risk_score_10, grade, components, weights, reasons, drivers, context
-    """
-    print("[RISK TOOL] invoked with applicant keys:", list(applicant.keys()) if isinstance(applicant, dict) else type(applicant))
-    try:
-        score_obj = compute_risk_score(applicant)
-        # Expect compute_risk_score to return a dict with at least 'risk_score_10' and 'grade'
-        out = {
-            "risk_score_10": score_obj.get("risk_score_10"),
-            "grade": score_obj.get("grade"),
-            "components": score_obj.get("components", {}),
-            "drivers": score_obj.get("drivers", []),
-            "context": score_obj.get("context", {}),
-        }
-        print(f"[RISK TOOL] success — score: {out['risk_score_10']} grade: {out['grade']}")
-        return out
-    except Exception as e:
-        msg = repr(e)
-        print("[RISK TOOL] Exception:", msg)
-        return {"risk_score_10": None, "grade": None, "components": {}, "drivers": [], "context": {}, "error": msg}
-    
-from langchain.prompts import PromptTemplate
-from langchain_core.output_parsers import JsonOutputParser
-
-
-
-@tool("Compliance Checker")
-def compliance_checker_tool(applicant: Dict[str, Any], guidelines: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Uses an LLM to analyze applicant details against RBI guideline summaries.
-    Returns a structured JSON with feature-wise compliance and a final verdict.
-    """
-
-    llm = get_llm()
-
-    prompt = PromptTemplate.from_template("""
-You are an RBI compliance officer.
-Compare each feature in the applicant's data with the guideline summaries provided below.
+RiskAgent Output:
+{json.dumps(risk, indent=2, default=str)}
 
 Rules:
-- "is_compliant": true if applicant follows the RBI rule
-- "is_compliant": false if violates
-- "is_compliant": "NO_DATA" if guideline is unclear or missing
-- Give a short, clear "reason" for each feature
-- final_verdict:
-    - "FAIL" if any feature violates
-    - "PASS" if all are compliant
-    - "INCOMPLETE" if rules missing for most features
+- risk_score_10 > 7 → reject (high risk)
+- 4 ≤ risk_score_10 ≤ 7 → cautious approval, model="blackbox"
+- risk_score_10 < 4 → confident approval, model="interpretable"
+- Any compliance violation → reject
 
-Return STRICTLY in valid JSON (no markdown, no explanations):
-
-{{
-  "feature_compliance": {{
-    "<feature_name>": {{
-      "is_compliant": true | false | "NO_DATA",
-      "reason": "<reason>"
-    }}
-  }},
-  "final_verdict": "PASS" | "FAIL" | "INCOMPLETE"
-}}
-
-### Applicant JSON:
-{applicant}
-
-### RBI Guidelines JSON:
-{guidelines}
-""")
-
-
-    # safer chain (no deprecated LLMChain)
-    from langchain.schema.runnable import RunnableSequence
-    from langchain.schema.output_parser import StrOutputParser
-
-    chain = prompt | get_llm() | StrOutputParser()
-
-
-    try:
-        raw_output = chain.invoke({"applicant": applicant, "guidelines": guidelines}).strip()
-
-        # ✅ enforce JSON parsing safety
-        try:
-            parsed = json.loads(raw_output)
-        except json.JSONDecodeError:
-            # fallback: try to clean accidental markdown / bad chars
-            cleaned = raw_output.strip("` \n").replace("json", "")
-            parsed = json.loads(cleaned)
-
-        # ✅ enforce structure if model drops keys
-        if "feature_compliance" not in parsed:
-            parsed["feature_compliance"] = {}
-        if "final_verdict" not in parsed:
-            parsed["final_verdict"] = "INCOMPLETE"
-
-        return parsed
-
-    except Exception as e:
-        return {
-            "error": f"Compliance checker failed: {str(e)}",
-            "feature_compliance": {},
-            "final_verdict": "INCOMPLETE"
-        }
-@tool("Decision Evaluator")
-def decision_evaluator_tool(policy_output: dict, risk_output: dict) -> dict:
-    """
-    Determines final loan eligibility, and if approved, selects ML model type.
-    Returns structured reasoning, probability, and final decision.
-    """
-
-    prompt = PromptTemplate.from_template("""
-You are an RBI-regulated credit decision AI.
-
-Your task is to make a *two-step decision* based on the applicant's RBI compliance and credit risk profile.
-
----
-
-### 🧩 Stage 1: Loan Eligibility
-1. Use **PolicyAgent Output** to determine compliance:
-   - If `final_decision` == "DECLINED" or any critical violations exist → reject immediately.
-   - If `final_decision` == "APPROVED" → continue to risk evaluation.
-2. Use **RiskAgent Output** to adjust eligibility:
-   - If `risk_score_10` > 7 → high risk → reject with low probability (≈0.3–0.4)
-   - If 4 ≤ `risk_score_10` ≤ 7 → moderate risk → cautious approval (≈0.6–0.75)
-   - If `risk_score_10` < 4 → low risk → confident approval (≈0.85–0.95)
-3. Give reasoning for rejection if ineligible (e.g., non-compliance, excessive risk, missing data).
-
----
-
-### ⚙️ Stage 2: Model Selection (only if loan_eligible = true)
-- Choose model type:
-  - `"blackbox"` → for borderline/moderate risk where nonlinear interactions likely matter.
-  - `"interpretable"` → for low-risk applicants needing explainable audit-friendly scoring.
-- Provide justification for your chosen model.
-
----
-
-### 🎯 Output Format (STRICT JSON only)
+Return STRICTLY valid JSON (no markdown):
 {{
   "loan_eligible": true | false,
-  "decision_reason": "<clear 2–3 line reasoning>",
-  "selected_model": "blackbox" | "interpretable" | "none"
-}}
+  "decision_reason": "<2-3 sentences>",
+  "selected_model": "blackbox" | "interpretable" | "none",
+  "approval_probability": 0.0
+}}"""
 
-### PolicyAgent Output:
-{policy_output}
+            raw = llm.invoke(prompt)
+            text = raw.content if hasattr(raw, "content") else str(raw)
 
-### RiskAgent Output:
-{risk_output}
-""")
+            # Extract JSON block
+            import re
+            m = re.search(r"\{[\s\S]*\}", text)
+            if m:
+                result = json.loads(m.group())
+                result.setdefault("loan_eligible",        risk_score < 7.0)
+                result.setdefault("decision_reason",      "Decision by LLM.")
+                result.setdefault("selected_model",       "blackbox")
+                result.setdefault("approval_probability", 1 - risk_score / 10)
+                return result
 
-    
-    from langchain.schema.output_parser import StrOutputParser
-   
-    chain = prompt | llm | StrOutputParser()
+        except Exception as exc:
+            logger.warning("[%s] Decision LLM failed (%s), using rule fallback", app_id, exc)
 
-    try:
-        result = chain.invoke({
-            "policy_output": policy_output,
-            "risk_output": risk_output
-        })
-        if not result or not result.strip():
-            raise ValueError("Empty response from LLM")
-    except Exception as e:
-        print(f"[RISK AGENT ERROR] {e}")
-        result = json.dumps({
-            "risk_score": 0.0,
-            "risk_grade": "UNKNOWN",
-            "reason": str(e)
-        })
-
-
-
-        # ensure valid structure
-        if not isinstance(result, dict):
-            result = json.loads(result)
-        result.setdefault("loan_eligible", False)
-        result.setdefault("selected_model", "none")
-        result.setdefault("decision_reason", "No reasoning provided.")
-
-        return result
-
-    except Exception as e:
+        # Pure rule-based fallback
+        eligible = risk_score < 7.0
         return {
-            "error": f"Decision evaluator failed: {e}",
-            "loan_eligible": False,
-            "selected_model": "none",
-            "decision_reason": f"Decision process error: {str(e)}"
+            "loan_eligible":        eligible,
+            "decision_reason":      (
+                f"Rule-based decision: risk_score={risk_score:.1f} "
+                f"({'below' if eligible else 'above'} threshold of 7.0)."
+            ),
+            "selected_model":       "interpretable" if risk_score < 4 else "blackbox",
+            "approval_probability": round(max(0.05, 1 - risk_score / 10), 2),
         }
-@tool("explainable AI Tool")
-def xai_tool(applicant: Dict[str, Any], risk_output: Dict[str, Any], compliance_output: Dict[str, Any],decision_output: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Provides clear, concise explanations for risk scores and compliance decisions to ensure transparency.
-    """
 
-    llm = get_llm()
+    # ── Stage 5b: XAI ─────────────────────────────────────────────────────
 
-    prompt_template = PromptTemplate.from_template("""
+    def _generate_xai(
+        self,
+        preprocessed:    Any,
+        raw_application: Dict[str, Any],
+        compliance:      Dict[str, Any],
+        risk:            Dict[str, Any],
+        decision:        Dict[str, Any],
+        app_id:          str,
+    ) -> Dict[str, Any]:
+        """
+        Generate SHAP/LIME + LLM explanations.
+        Degrades gracefully: if the Keras model / explainers are unavailable,
+        falls back to a Groq-generated natural-language summary.
+        """
+        try:
+            from agents.xai_agent import explain_prediction
+            return explain_prediction(preprocessed, raw_application, compliance, risk)
+        except Exception as exc:
+            logger.warning("[%s] XAI full pipeline failed (%s), using LLM fallback", app_id, exc)
 
-    """)
+        # Groq-generated explanation fallback (always works if API key is set)
+        return self._llm_xai_fallback(raw_application, compliance, risk, decision, app_id)
 
+    def _llm_xai_fallback(
+        self,
+        raw_application: Dict[str, Any],
+        compliance:      Dict[str, Any],
+        risk:            Dict[str, Any],
+        decision:        Dict[str, Any],
+        app_id:          str,
+    ) -> Dict[str, Any]:
+        """Generate explanation using Groq when SHAP/LIME/Keras unavailable."""
+        try:
+            llm        = get_llm(TaskType.SMART)
+            eligible   = decision.get("loan_eligible", False)
+            risk_score = risk.get("risk_score_10", "N/A")
+            grade      = risk.get("grade", "N/A")
+            bureau     = raw_application.get("bureau_score", "N/A")
+            foir       = raw_application.get("foir_total_obligations_pct", "N/A")
+            loan_type  = raw_application.get("loan_type", "loan")
 
-# -----------------------------------------------------------------------------
-# LEGACY RUNNER (for backward compatibility)
-# -----------------------------------------------------------------------------
-def run_sync(applicant_dict: Dict[str, Any]):
-    """
-    Legacy runner for backward compatibility
-    Use LoanDecisionOrchestrator.evaluate_application() for new code
-    """
-    orchestrator = LoanDecisionOrchestrator()
-    return orchestrator.evaluate_application(applicant_dict)
+            user_prompt = f"""You are a loan officer explaining a decision to an applicant.
 
-# -----------------------------------------------------------------------------
-# Demo
-# -----------------------------------------------------------------------------
-if __name__ == "__main__":
-    sample = {
-        "application_id": "APP-0001",
-        "loan_type": "housing loan",
-        "age_years": 32,
-        "bureau_score": 720,
-        "monthly_income_inr": 55000,
-        "foir_total_obligations_pct": 25.0,
-        "requested_amount_inr": 300000,
-        "tenure_months": 36,
-        "gender": "Male",
-        "state": "Maharashtra",
-        "kyc_mode": "Video KYC",
-        "ovd_type": "Aadhaar",
-        "interest_type": "Fixed",
-        "pep_flag": False,
-        "kfs_provided": True,
-        "processing_fee_inr": 2000.0,
-        "other_charges_inr": 500.0,
-        "apr_pct": 12.5,
-        "property_value_inr": 1000000,
-        "ltv_ratio": 0.3,
-    }
+Decision: {"APPROVED" if eligible else "REJECTED"}
+Risk Grade: {grade} (score {risk_score}/10)
+Key factors: bureau_score={bureau}, FOIR={foir}%, loan_type={loan_type}
+Compliance: {"PASS" if compliance.get("is_compliant") else "FAIL"}
 
-    orchestrator = LoanDecisionOrchestrator()
-    result = orchestrator.evaluate_application(sample)
-    print("\n=== Orchestrator Result ===")
-    print(json.dumps(result, indent=2, default=str))
+Write 3-4 plain-English sentences explaining why the {loan_type} loan was {"approved" if eligible else "rejected"}.
+Mention specific numbers. Be empathetic but factual."""
+
+            user_raw  = llm.invoke(user_prompt)
+            user_text = user_raw.content if hasattr(user_raw, "content") else str(user_raw)
+
+            reg_prompt = f"""You are a financial auditor preparing a regulatory compliance report.
+
+Application: {loan_type} loan
+Decision: {"APPROVED" if eligible else "REJECTED"}
+Risk: grade={grade}, score={risk_score}/10
+Compliance score: {compliance.get("compliance_score", 0):.2f}
+Hard violations: {len(compliance.get("hard_violations", []))}
+Soft violations: {len(compliance.get("soft_violations", []))}
+Risk drivers: {risk.get("drivers", [])}
+
+Write a 2-paragraph structured report suitable for regulatory audit.
+Paragraph 1: Executive summary of the decision.
+Paragraph 2: Technical risk and compliance analysis."""
+
+            reg_raw  = llm.invoke(reg_prompt)
+            reg_text = reg_raw.content if hasattr(reg_raw, "content") else str(reg_raw)
+
+            return {
+                "user_explanation":      user_text.strip(),
+                "regulator_explanation": reg_text.strip(),
+                "raw_data":              {
+                    "explanation_source": "groq_fallback",
+                    "shap_available":     False,
+                    "lime_available":     False,
+                    "decision":           "approved" if eligible else "rejected",
+                    "risk_drivers":       risk.get("drivers", []),
+                },
+            }
+
+        except Exception as exc:
+            logger.error("[%s] LLM XAI fallback failed: %s", app_id, exc)
+            eligible = decision.get("loan_eligible", False)
+            return {
+                "user_explanation":      (
+                    "Your application has been reviewed. "
+                    f"Decision: {'Approved' if eligible else 'Rejected'}. "
+                    "Please contact your branch for detailed reasoning."
+                ),
+                "regulator_explanation": (
+                    f"Automated decision: {'APPROVED' if eligible else 'REJECTED'}. "
+                    f"Risk grade: {risk.get('grade','N/A')}. "
+                    "Full XAI pipeline unavailable; decision based on deterministic rules and risk score."
+                ),
+                "raw_data": {"explanation_source": "static_fallback", "error": str(exc)},
+            }
+
+    # ── Response builders ─────────────────────────────────────────────────
+
+    def _build_response(
+        self,
+        application_id:  str,
+        compliance_dict: Dict[str, Any],
+        risk_dict:       Dict[str, Any],
+        decision_dict:   Dict[str, Any],
+        xai_dict:        Dict[str, Any],
+        processing_ms:   int,
+    ) -> Dict[str, Any]:
+        """Assemble the final structured response matching FinalDecisionResponse."""
+
+        eligible   = decision_dict.get("loan_eligible", False)
+        decision   = "APPROVED" if eligible else "REJECTED"
+        risk_score = float(risk_dict.get("risk_score_10", 5.0))
+
+        # Confidence: high at extremes, lower in borderline zone
+        if risk_score < 3.0 and compliance_dict.get("is_compliant"):
+            confidence = 0.92
+        elif risk_score > 7.5 or not compliance_dict.get("is_compliant"):
+            confidence = 0.93
+        else:
+            confidence = 0.68
+
+        return {
+            "application_id":   application_id,
+            "decision":         decision,
+            "confidence_score": confidence,
+            "processing_time_ms": processing_ms,
+            "loan_eligible":    eligible,
+            "selected_model":   decision_dict.get("selected_model", "none"),
+
+            # ── Risk Assessment ───────────────────────────────────────
+            "risk_assessment": {
+                "risk_score_10":  risk_score,
+                "grade":          risk_dict.get("grade", "UNKNOWN"),
+                "components":     risk_dict.get("components", {}),
+                "drivers":        risk_dict.get("drivers", []),
+                "reasons":        risk_dict.get("reasons", []),
+                "context":        risk_dict.get("context", {}),
+            },
+
+            # ── Compliance ────────────────────────────────────────────
+            "compliance_result": {
+                "is_compliant":    compliance_dict.get("is_compliant", False),
+                "compliance_score":compliance_dict.get("compliance_score", 0.0),
+                "violations":      compliance_dict.get("violations", []),
+                "hard_violations": compliance_dict.get("hard_violations", []),
+                "soft_violations": compliance_dict.get("soft_violations", []),
+                "explanation":     compliance_dict.get("explanation", ""),
+                "rules_applied":   compliance_dict.get("rules_applied", []),
+            },
+
+            # ── Decision Summary ──────────────────────────────────────
+            "decision_reason":  decision_dict.get("decision_reason", ""),
+            "approval_probability": float(decision_dict.get("approval_probability", 0.0)),
+
+            # ── Explanations ──────────────────────────────────────────
+            "explanations": {
+                "customer_explanation":  xai_dict.get("user_explanation", ""),
+                "technical_explanation": xai_dict.get("regulator_explanation", ""),
+                "raw_data":              xai_dict.get("raw_data", {}),
+            },
+
+            # ── Metadata ─────────────────────────────────────────────
+            "metadata": {
+                "application_id":  application_id,
+                "pipeline_version":"v2.0",
+                "llm_provider":    os.getenv("GROQ_API_KEY") and "groq" or "mock",
+                "timestamp":       datetime.utcnow().isoformat(),
+            },
+        }
+
+    def _rejection_response(
+        self,
+        application_id: str,
+        violations:     List[Dict],
+        rules_applied:  List[str],
+        processing_ms:  int,
+    ) -> Dict[str, Any]:
+        messages = [v.get("message", "Violation") for v in violations]
+        return {
+            "application_id":   application_id,
+            "decision":         "REJECTED",
+            "confidence_score": 0.98,
+            "processing_time_ms": processing_ms,
+            "loan_eligible":    False,
+            "selected_model":   "rule_engine",
+
+            "risk_assessment": {
+                "risk_score_10": 10.0,
+                "grade":         "E",
+                "components":    {},
+                "drivers":       ["hard_compliance_violation"],
+                "reasons":       messages,
+                "context":       {},
+            },
+
+            "compliance_result": {
+                "is_compliant":    False,
+                "compliance_score":0.0,
+                "violations":      violations,
+                "hard_violations": violations,
+                "soft_violations": [],
+                "explanation":     f"Application rejected: {'; '.join(messages)}",
+                "rules_applied":   rules_applied,
+            },
+
+            "decision_reason": f"Hard regulatory violations: {'; '.join(messages)}",
+            "approval_probability": 0.0,
+
+            "explanations": {
+                "customer_explanation": (
+                    "Your application could not be approved at this time because it does not "
+                    "meet one or more mandatory regulatory requirements. "
+                    f"Issues: {'; '.join(messages)}. "
+                    "Please contact your branch for guidance on resolving these issues."
+                ),
+                "technical_explanation": (
+                    f"Hard constraint evaluation failed for {len(violations)} rule(s). "
+                    f"Rules applied: {', '.join(rules_applied)}. "
+                    "Application short-circuited before ML inference."
+                ),
+                "raw_data": {"violations": violations, "rules_applied": rules_applied},
+            },
+
+            "metadata": {
+                "application_id":   application_id,
+                "pipeline_version": "v2.0",
+                "short_circuit":    True,
+                "timestamp":        datetime.utcnow().isoformat(),
+            },
+        }
+
+    def _error_response(self, application_id: str, error: str, processing_ms: int) -> Dict[str, Any]:
+        return {
+            "application_id":   application_id,
+            "decision":         "ERROR",
+            "confidence_score": 0.0,
+            "processing_time_ms": processing_ms,
+            "loan_eligible":    False,
+            "selected_model":   "none",
+
+            "risk_assessment":  {"risk_score_10": 0.0, "grade": "UNKNOWN", "components": {},
+                                 "drivers": [], "reasons": [error], "context": {}},
+            "compliance_result":{"is_compliant": False, "compliance_score": 0.0,
+                                 "violations": [], "hard_violations": [], "soft_violations": [],
+                                 "explanation": error, "rules_applied": []},
+
+            "decision_reason":  f"System error: {error}",
+            "approval_probability": 0.0,
+
+            "explanations": {
+                "customer_explanation":  "We were unable to process your application. Please try again.",
+                "technical_explanation": f"Pipeline error: {error}",
+                "raw_data":              {"error": error},
+            },
+            "metadata": {
+                "application_id":   application_id,
+                "pipeline_version": "v2.0",
+                "error":            error,
+                "timestamp":        datetime.utcnow().isoformat(),
+            },
+        }
+
+    # ── Helpers ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _elapsed_ms(start: datetime) -> int:
+        return int((datetime.utcnow() - start).total_seconds() * 1000)
+
+    @staticmethod
+    def _compliance_pass_fallback(hard_result) -> Dict[str, Any]:
+        """Return a minimal PASS compliance dict when soft evaluation errors out."""
+        return {
+            "is_compliant":    True,
+            "compliance_score":0.85,
+            "violations":      [],
+            "hard_violations": [],
+            "soft_violations": [],
+            "explanation":     "Hard constraints passed. Soft evaluation unavailable.",
+            "rules_applied":   hard_result.rules_applied,
+        }

@@ -179,6 +179,21 @@ class DerivedFeatureTransformer(BaseEstimator, TransformerMixin):
         return X
 
 
+class InterestTypeTransformer(BaseEstimator, TransformerMixin):
+    """Encodes interest_type column to 0/1. Module-level class — picklable."""
+
+    def fit(self, X, y=None):
+        self.fitted_ = True
+        return self
+
+    def transform(self, X):
+        if isinstance(X, np.ndarray):
+            return X
+        X = X.copy()
+        X['interest_type_encoded'] = X['interest_type'].map({'Fixed': 0, 'Floating': 1}).fillna(0)
+        return X[['interest_type_encoded']].values
+
+
 class FeatureOrderTransformer(BaseEstimator, TransformerMixin):
     """Ensures consistent feature ordering for model compatibility."""
     
@@ -197,9 +212,16 @@ class FeatureOrderTransformer(BaseEstimator, TransformerMixin):
         ]
     
     def fit(self, X: pd.DataFrame, y=None):
+        # Set fitted_ attribute so sklearn's check_is_fitted passes
+        self.fitted_ = True
         return self
     
-    def transform(self, X: pd.DataFrame) -> pd.DataFrame:
+    def transform(self, X) -> np.ndarray:
+        """Accepts both DataFrame and numpy array from ColumnTransformer."""
+        # If we receive a numpy array (from ColumnTransformer), just return it
+        if isinstance(X, np.ndarray):
+            return X
+        
         X = X.copy()
         
         # Add missing columns with default values
@@ -208,9 +230,8 @@ class FeatureOrderTransformer(BaseEstimator, TransformerMixin):
                 X[col] = 0
         
         # Reorder columns to match training
-        X = X[self.feature_order]
-        
-        return X
+        available = [c for c in self.feature_order if c in X.columns]
+        return X[available].values
 
 
 def create_preprocessing_pipeline() -> Union['Pipeline', 'SimplifiedPipeline']:
@@ -258,16 +279,8 @@ def create_sklearn_pipeline() -> 'Pipeline':
         dtype=np.int32
     )
     
-    # Custom function for interest type encoding
-    def encode_interest_type(X):
-        X = X.copy()
-        X['interest_type_encoded'] = X['interest_type'].map({'Fixed': 0, 'Floating': 1}).fillna(0)
-        return X[['interest_type_encoded']]
-    
-    interest_type_transformer = FunctionTransformer(
-        func=encode_interest_type,
-        validate=False
-    )
+    # Use InterestTypeTransformer class (picklable) instead of local FunctionTransformer
+    interest_type_transformer = InterestTypeTransformer()
     
     # Column transformer to handle different feature types
     column_transformer = ColumnTransformer(
