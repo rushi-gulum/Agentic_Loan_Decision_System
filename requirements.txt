@@ -60,10 +60,11 @@ python-dotenv>=1.0.0
 # ── Production Server ──────────────────────────────────────────────────────
 gunicorn>=21.0.0
 
-# ── AI Agent Framework (optional — falls back to LangChain if unavailable) ─
-# crewai requires Python >=3.10,<=3.13 — safe on 3.11.
-# The orchestrator catches ImportError and uses LangChain directly.
-crewai>=0.83.0
+# ── AI Agent Framework ─────────────────────────────────────────────────────
+# CrewAI has been REMOVED. The system uses pure LangChain + Groq for all
+# agentic orchestration. This avoids the Python <=3.13 constraint that
+# crewai imposes and eliminates the dependency entirely.
+# langchain-core and langchain-groq above provide everything needed.
 
 # ── Testing (excluded from Render build via render.yaml if desired) ─────────
 pytest>=7.4.0

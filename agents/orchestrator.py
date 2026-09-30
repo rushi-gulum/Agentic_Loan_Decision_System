@@ -8,12 +8,12 @@ LoanDecisionOrchestrator — single authoritative execution path.
   2. Hard compliance    rules/rule_engine.py          (deterministic, no LLM)
   3. Soft compliance    agents/compliance_agent.py    (RAG + Groq)
   4. Risk assessment    agents/risk_agent.py          (deterministic math)
-  5. Decision + XAI     agents/decision_agent.py      (Groq via get_crewai_llm)
+  5. Decision + XAI     (Groq via get_llm)
                         agents/xai_agent.py           (SHAP/LIME + Groq)
 
-LLM provider: ALL agent LLM calls go through utils/llm_utility.get_crewai_llm()
+LLM provider: ALL LLM calls go through utils/llm_utility.get_llm()
               which routes Groq → OpenAI → MockLLM in priority order.
-              No direct OpenAI() instantiation anywhere in this file.
+              No CrewAI dependency anywhere in this file.
 """
 
 import os
@@ -35,8 +35,8 @@ from agents.compliance_agent import check_rbi_compliance
 from agents.risk_agent import compute_risk_score
 from agents.rag_agent import retrieve_feature_guidelines
 
-# ── Unified LLM (Groq-primary, no hard-coded provider) ───────────────────
-from utils.llm_utility import get_crewai_llm, get_llm, TaskType
+# ── Unified LLM (Groq-primary, pure LangChain — no CrewAI) ───────────────
+from utils.llm_utility import get_llm, TaskType
 
 logger = logging.getLogger(__name__)
 
@@ -50,22 +50,18 @@ class LoanDecisionOrchestrator:
     """
 
     def __init__(self):
-        """
-        Lazy-initialise: heavy components (CrewAI agents, explainer) are
-        created on first use so the import itself is cheap.
-        """
-        self._crewai_llm: Optional[Any]  = None   # initialised lazily
-        self._xai_ready:  bool           = False
+        """Lazy init — LLM created on first request, not at import time."""
+        self._llm: Optional[Any] = None
         logger.info("LoanDecisionOrchestrator created (lazy init)")
 
     # ── Lazy LLM accessor ────────────────────────────────────────────────
 
     def _get_llm(self):
-        """Return a CrewAI-compatible LLM routed through unified utility."""
-        if self._crewai_llm is None:
-            self._crewai_llm = get_crewai_llm(TaskType.SMART)
-            logger.info("LLM initialised: %s", type(self._crewai_llm).__name__)
-        return self._crewai_llm
+        """Return a LangChain LLM routed through unified utility (Groq-primary)."""
+        if self._llm is None:
+            self._llm = get_llm(TaskType.SMART)
+            logger.info("LLM initialised: %s", type(self._llm).__name__)
+        return self._llm
 
     # ── Public entry point ────────────────────────────────────────────────
 
