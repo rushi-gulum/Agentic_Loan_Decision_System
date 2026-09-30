@@ -31,27 +31,23 @@ class Config:
     """Configuration management for different deployment environments"""
     
     def __init__(self):
-        # Environment detection
-        self.is_cloud = self._detect_cloud_environment()
+        # API endpoint: check Streamlit secrets first, then env var, then default
+        try:
+            # Streamlit Cloud: secrets set in dashboard
+            self.API_BASE_URL = st.secrets["API_BASE_URL"]
+            self.is_cloud = True
+        except (KeyError, FileNotFoundError):
+            # Local dev: use env var or hardcoded URL
+            self.API_BASE_URL = os.getenv(
+                "API_BASE_URL",
+                "https://loan-decision-api-y23b.onrender.com"  # actual Render URL
+            )
+            self.is_cloud = False
         
-        # API endpoints based on environment
-        if self.is_cloud:
-            # Production API endpoint (set this in Streamlit secrets or environment)
-            self.API_BASE_URL = st.secrets.get("API_BASE_URL", "https://loan-decision-api.onrender.com")
-        else:
-            # Local development
-            self.API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
-        
-        self.API_ENDPOINT = f"{self.API_BASE_URL}/api/v1/evaluate"
+        self.API_ENDPOINT   = f"{self.API_BASE_URL}/api/v1/evaluate"
         self.HEALTH_ENDPOINT = f"{self.API_BASE_URL}/health"
-    
-    def _detect_cloud_environment(self) -> bool:
-        """Detect if running on Streamlit Community Cloud"""
-        return (
-            "STREAMLIT_SHARING" in os.environ or 
-            "streamlit.io" in os.environ.get("HOSTNAME", "") or
-            hasattr(st, "secrets") and "API_BASE_URL" in st.secrets
-        )
+        self.HISTORY_ENDPOINT = f"{self.API_BASE_URL}/api/v1/history"
+        self.STATS_ENDPOINT   = f"{self.API_BASE_URL}/api/v1/stats"
 
 config = Config()
 
@@ -93,21 +89,32 @@ def apply_custom_css():
     """, unsafe_allow_html=True)
 
 def show_api_status():
-    """Display API connection status"""
+    """Display API connection status in sidebar"""
     try:
-        response = requests.get(config.HEALTH_ENDPOINT, timeout=5)
+        response = requests.get(config.HEALTH_ENDPOINT, timeout=15)
         if response.status_code == 200:
-            health_data = response.json()
-            st.sidebar.success(f"✅ API Connected ({health_data.get('environment', 'unknown')})")
+            health = response.json()
+            overall = health.get("status", "unknown")
+            if overall == "healthy":
+                st.sidebar.success(f"✅ API Connected")
+            else:
+                st.sidebar.warning(f"⚠️ API Degraded")
             
-            # Show API details in expander
-            with st.sidebar.expander("API Details"):
-                st.json(health_data)
+            with st.sidebar.expander("Component Status"):
+                for name, comp in health.get("components", {}).items():
+                    icon = "✅" if comp.get("status") == "healthy" else "⚠️"
+                    st.write(f"{icon} **{name}**: {comp.get('status','?')}")
+        elif response.status_code == 503:
+            st.sidebar.warning("⚠️ API Starting Up...")
         else:
             st.sidebar.error(f"❌ API Error: {response.status_code}")
-    except requests.exceptions.RequestException as e:
-        st.sidebar.error(f"❌ API Unavailable: {str(e)[:50]}...")
-        st.sidebar.info("💡 Try refreshing or check if the API server is running")
+    except requests.exceptions.Timeout:
+        st.sidebar.warning("⏳ API Waking Up (free tier cold start ~30s)")
+        st.sidebar.info("Try again in 30 seconds")
+    except requests.exceptions.ConnectionError:
+        st.sidebar.error("❌ API Unreachable")
+    except Exception as e:
+        st.sidebar.error(f"❌ {str(e)[:60]}")
 
 def create_loan_form() -> Optional[Dict[str, Any]]:
     """Create and return loan application form data"""
@@ -200,61 +207,45 @@ def create_loan_form() -> Optional[Dict[str, Any]]:
 def display_results(result: Dict[str, Any]):
     """Display evaluation results with rich formatting"""
     
-    # Overall Decision
-    decision = result.get("decision", "Unknown")
-    confidence = result.get("confidence", 0)
+    decision    = result.get("decision", "Unknown")
+    confidence  = round(float(result.get("confidence_score", 0)) * 100, 1)
     
-    if decision.upper() == "APPROVED":
-        st.success(f"🎉 **LOAN APPROVED** (Confidence: {confidence}%)")
-    elif decision.upper() == "REJECTED":
-        st.error(f"❌ **LOAN REJECTED** (Confidence: {confidence}%)")
+    if str(decision).upper() == "APPROVED":
+        st.success(f"🎉 **LOAN APPROVED** — Confidence: {confidence}%")
+    elif str(decision).upper() == "REJECTED":
+        st.error(f"❌ **LOAN REJECTED** — Confidence: {confidence}%")
     else:
-        st.warning(f"🔍 **MANUAL REVIEW REQUIRED** (Confidence: {confidence}%)")
+        st.warning(f"🔍 **{decision}** — Confidence: {confidence}%")
     
-    # Create tabs for detailed results
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Executive Summary", "🛡️ Compliance", "📈 Risk Assessment", "🔍 Explanations"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Summary", "🛡️ Compliance", "📈 Risk", "🔍 Explanation"])
     
     with tab1:
         display_executive_summary(result)
-    
     with tab2:
         display_compliance_details(result)
-    
     with tab3:
         display_risk_assessment(result)
-    
     with tab4:
         display_explanations(result)
 
 def display_executive_summary(result: Dict[str, Any]):
     """Display executive summary with key metrics"""
     
-    st.subheader("Executive Summary")
-    
-    # Key metrics
     col1, col2, col3, col4 = st.columns(4)
-    
     with col1:
-        st.metric("Final Decision", result.get("decision", "N/A"))
-    
+        st.metric("Decision", result.get("decision", "N/A"))
     with col2:
-        confidence = result.get("confidence", 0)
-        st.metric("Confidence Score", f"{confidence}%")
-    
+        conf = round(float(result.get("confidence_score", 0)) * 100, 1)
+        st.metric("Confidence", f"{conf}%")
     with col3:
-        processing_time = result.get("processing_time_ms", 0)
-        st.metric("Processing Time", f"{processing_time}ms")
-    
+        ms = result.get("metadata", {}).get("processing_time_ms", 0)
+        st.metric("Processing Time", f"{int(ms)}ms")
     with col4:
-        model_used = result.get("model_used", "N/A")
-        st.metric("Model Used", model_used)
+        st.metric("Model", result.get("selected_model", "N/A"))
     
-    # Key factors
-    key_factors = result.get("key_factors", [])
-    if key_factors:
-        st.subheader("Key Decision Factors")
-        for i, factor in enumerate(key_factors[:5]):
-            st.write(f"{i+1}. {factor}")
+    reason = result.get("decision_reason", "")
+    if reason:
+        st.markdown(f"**Reason:** {reason}")
 
 def display_compliance_details(result: Dict[str, Any]):
     """Display detailed compliance information"""
@@ -339,19 +330,27 @@ def display_risk_assessment(result: Dict[str, Any]):
 def display_explanations(result: Dict[str, Any]):
     """Display AI-generated explanations"""
     
-    explanations = result.get("explanations", {})
+    # New schema: xai_report.customer_summary / regulator_summary
+    xai = result.get("xai_report") or {}
     
-    # Customer explanation
-    customer_explanation = explanations.get("customer_explanation", "")
-    if customer_explanation:
+    customer = xai.get("customer_summary") or result.get("decision_reason", "")
+    technical = xai.get("regulator_summary", "")
+    
+    if customer:
         st.subheader("👤 Customer Explanation")
-        st.info(customer_explanation)
+        st.info(customer)
     
-    # Technical explanation
-    technical_explanation = explanations.get("technical_explanation", "")
-    if technical_explanation:
-        with st.expander("🔧 Technical Details"):
-            st.write(technical_explanation)
+    if technical:
+        with st.expander("🔧 Regulatory Details"):
+            st.write(technical)
+    
+    # SHAP summary if available
+    shap_summary = xai.get("shap_summary", {})
+    top_features = xai.get("top_features", [])
+    if top_features:
+        st.subheader("🔍 Key Decision Features")
+        for f in top_features[:5]:
+            st.write(f"• {f}")
 
 def create_mock_result(application_data: Dict[str, Any]) -> Dict[str, Any]:
     """Create mock result for demo purposes when API is unavailable"""
@@ -411,31 +410,30 @@ def main():
     
     # App header
     st.markdown('<h1 class="main-header">🏦 Agentic Loan Decision System</h1>', unsafe_allow_html=True)
-    st.markdown("**AI-powered loan approval with regulatory compliance and explainable decisions**")
+    st.markdown("**AI-powered loan approval with RBI regulatory compliance and explainable decisions**")
     
     # Sidebar
     st.sidebar.title("🔧 System Status")
     show_api_status()
-    
     st.sidebar.markdown("---")
-    st.sidebar.info(f"**Environment**: {'Cloud' if config.is_cloud else 'Local'}")
-    st.sidebar.info(f"**API Endpoint**: {config.API_BASE_URL}")
+    env_label = "☁️ Cloud" if config.is_cloud else "💻 Local"
+    st.sidebar.caption(f"{env_label} | {config.API_BASE_URL}")
     
-    # Main content area
-    with st.container():
+    # Tabs: Evaluate / History
+    tab_eval, tab_history = st.tabs(["📋 Evaluate Application", "📊 Decision History"])
+    
+    with tab_eval:
         # Loan application form
         application_data = create_loan_form()
         
-        # Process application if submitted
         if application_data:
-            with st.spinner("🤖 Processing loan application..."):
+            with st.spinner("🤖 Processing loan application through AI pipeline..."):
                 try:
-                    # Make API request
                     response = requests.post(
                         config.API_ENDPOINT,
                         json=application_data,
                         headers={"Content-Type": "application/json"},
-                        timeout=30
+                        timeout=120,   # allow time for Groq + ML pipeline
                     )
                     
                     if response.status_code == 200:
@@ -443,18 +441,45 @@ def main():
                         st.success("✅ Application processed successfully!")
                         display_results(result)
                     else:
-                        st.error(f"❌ API Error: {response.status_code}")
-                        st.json(response.json() if response.content else {"error": "No response content"})
+                        try:
+                            err = response.json()
+                        except Exception:
+                            err = {"detail": response.text[:300]}
+                        st.error(f"❌ API Error {response.status_code}: {err.get('detail', err)}")
                         
-                except requests.exceptions.RequestException as e:
-                    st.error(f"❌ Connection Error: {str(e)}")
-                    st.warning("💡 Please check if the API server is running and accessible.")
-                    
-                    # Show mock result for demo purposes if API is unavailable
+                except requests.exceptions.Timeout:
+                    st.warning("⏳ Request timed out — the API may be waking up (free tier cold start).")
+                    st.info("Please wait 30 seconds and try again. The first request after inactivity takes longer.")
+                except requests.exceptions.ConnectionError:
+                    st.error("❌ Cannot reach the API server.")
                     if st.button("🎭 Show Demo Result (Mock Data)"):
-                        mock_result = create_mock_result(application_data)
                         st.info("📝 This is a demo result using mock data")
-                        display_results(mock_result)
+                        display_results(create_mock_result(application_data))
+    
+    with tab_history:
+        st.subheader("📊 Recent Loan Decisions")
+        if st.button("🔄 Load Decision History"):
+            try:
+                r = requests.get(config.HISTORY_ENDPOINT, params={"limit": 20}, timeout=15)
+                if r.status_code == 200:
+                    data = r.json()
+                    decisions = data.get("decisions", [])
+                    if decisions:
+                        import pandas as pd
+                        df = pd.DataFrame(decisions)
+                        cols = ["application_id", "decision", "risk_grade", "compliance_status",
+                                "loan_type", "bureau_score", "confidence", "llm_provider"]
+                        df = df[[c for c in cols if c in df.columns]]
+                        st.dataframe(df, use_container_width=True)
+                        st.caption(f"Showing {len(decisions)} most recent decisions")
+                    else:
+                        st.info("No decisions logged yet. Submit a loan application first.")
+                else:
+                    st.error(f"Could not load history: HTTP {r.status_code}")
+            except requests.exceptions.Timeout:
+                st.warning("⏳ Request timed out — API may be waking up.")
+            except Exception as e:
+                st.error(f"Error: {e}")
 
 if __name__ == "__main__":
     main()

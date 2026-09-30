@@ -57,8 +57,10 @@ async def lifespan(app: FastAPI):
     # ── Step 1: Model artefacts ──────────────────────────────────────────
     logger.info("━━━ [1/3] Model artefacts ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     try:
+        import asyncio as _aio
         from utils.model_loader import download_models, check_model_health
-        result = download_models()        # no-op if files already cached
+        loop = _aio.get_event_loop()
+        result = await loop.run_in_executor(None, download_models)
         health = check_model_health()
         if result["success"]:
             logger.info("✅ Models ready  (repo=%s  downloaded=%d  cached=%d)",
@@ -237,19 +239,20 @@ async def health_check(request: Request) -> Dict[str, Any]:
     except Exception as exc:
         db_health = {"status": "error", "error": str(exc)}
 
-    # ── 3. LLM — test a real Groq call ───────────────────────────────────
+    # ── 3. LLM — use cached startup state, skip live API call ──────────────
     try:
-        from utils.llm_utility import get_llm, TaskType
-        _llm = get_llm(TaskType.FAST)
-        _resp = _llm.invoke("Reply with one word: HEALTHY")
-        _text = _resp.content if hasattr(_resp, "content") else str(_resp)
-        provider = "groq" if os.getenv("GROQ_API_KEY") else "mock"
+        from utils.llm_utility import get_llm_provider, LLMProvider
+        provider = get_llm_provider()
         llm_health = {
-            "status":    "healthy",
-            "provider":  provider,
-            "model":     os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b"),
-            "ping":      _text.strip()[:40],
+            "status":   "healthy",
+            "provider": provider.value,
+            "model":    os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b"),
+            "note":     "provider detected from env (no live ping on health check)",
         }
+        # Only mark unhealthy if NO provider is configured at all
+        if provider == LLMProvider.MOCK and not os.getenv("GROQ_API_KEY") and not os.getenv("OPENAI_API_KEY"):
+            llm_health["status"] = "degraded"
+            llm_health["note"]   = "No LLM API key configured — using MockLLM"
     except Exception as exc:
         llm_health = {"status": "error", "provider": "unknown", "error": str(exc)}
 
