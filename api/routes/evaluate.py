@@ -3,18 +3,16 @@ api/routes/evaluate.py
 ======================
 POST /api/v1/evaluate  — core loan evaluation endpoint
 
-Changes from v1:
-  • Depends(get_db)  injects a Neon Postgres session into every request
-  • Every evaluation is persisted to `loan_decisions` via log_decision()
-  • Normalised violations written to `compliance_violations`
-  • application_id generated once; echoed in response metadata
-  • Structured error responses with request-id tracing
+Key responsibility: bridge the orchestrator's flat response dict into the
+strict FinalDecisionResponse Pydantic schema via _normalize_to_schema().
+Every evaluation is also persisted to Neon Postgres for audit.
 """
 
+import os
 import uuid
 import logging
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status, Request
@@ -29,12 +27,9 @@ from api.schemas import (
 from utils.db_utils import get_db, log_decision
 
 logger = logging.getLogger(__name__)
-
 router = APIRouter()
 
-# ---------------------------------------------------------------------------
-# Orchestrator — singleton, initialised lazily on first request
-# ---------------------------------------------------------------------------
+# ── Orchestrator singleton ────────────────────────────────────────────────
 
 _orchestrator = None
 
@@ -47,103 +42,145 @@ def _get_orchestrator():
     return _orchestrator
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# ── Schema normalisation ──────────────────────────────────────────────────
+# Maps the orchestrator's internal dict into FinalDecisionResponse's exact shape.
+# This isolates schema-breaking changes in the orchestrator from the API contract.
 
-def _safe_float(value, default: float = 0.0) -> float:
-    try:
-        return float(value) if value is not None else default
-    except (TypeError, ValueError):
-        return default
+_VALID_DECISIONS = {"APPROVED", "REJECTED", "ESCALATED", "REVIEW_REQUIRED"}
+_VALID_GRADES    = {"A+", "A", "B", "C", "D", "E"}
 
-def _safe_int(value, default: int = 0) -> int:
-    try:
-        return int(value) if value is not None else default
-    except (TypeError, ValueError):
-        return default
+
+def _normalize_to_schema(raw: Dict[str, Any], application_id: str) -> Dict[str, Any]:
+    """Bridge orchestrator dict → FinalDecisionResponse-compatible dict."""
+
+    # decision (enum guard)
+    decision = str(raw.get("decision", "REJECTED")).upper()
+    if decision not in _VALID_DECISIONS:
+        decision = "REJECTED"
+
+    # risk_assessment (grade enum guard)
+    ra    = raw.get("risk_assessment", {})
+    grade = str(ra.get("grade", "E")).upper()
+    if grade not in _VALID_GRADES:
+        grade = "E"
+
+    risk_assessment = {
+        "risk_score_10": float(ra.get("risk_score_10", 10.0)),
+        "grade":         grade,
+        "components":    ra.get("components", {}),
+        "drivers":       ra.get("drivers",    []),
+        "context":       ra.get("context",    {}),
+        "reasons":       ra.get("reasons",    []),
+    }
+
+    # compliance_result (fill required fields the orchestrator may omit)
+    cr        = raw.get("compliance_result", {})
+    loan_type = str(raw.get("loan_type", "") or cr.get("loan_type", "") or "unknown")
+
+    compliance_result = {
+        "is_compliant":        bool(cr.get("is_compliant", False)),
+        "compliance_score":    float(cr.get("compliance_score", 0.0)),
+        "hard_violations":     cr.get("hard_violations",     []),
+        "hard_warnings":       cr.get("hard_warnings",       []),  # required by schema
+        "soft_violations":     cr.get("soft_violations",     []),
+        "explanation":         str(cr.get("explanation",     "")),
+        "loan_type":           loan_type,                          # required by schema
+        "rules_applied":       cr.get("rules_applied",       []),
+        "rag_guidelines_used": cr.get("rag_guidelines_used", []),  # required by schema
+    }
+
+    # xai_report (Optional — map orchestrator "explanations" dict into XAIReport shape)
+    exp = raw.get("explanations", {})
+    xai_report = {
+        "model_used":              raw.get("selected_model", "none"),
+        "prediction_probability":  {
+            "approved": float(raw.get("approval_probability", 0.0)),
+            "rejected": round(1.0 - float(raw.get("approval_probability", 0.0)), 4),
+        },
+        "shap_summary":            exp.get("raw_data", {}),
+        "lime_explanation":        [],
+        "customer_summary":        str(exp.get("customer_explanation",  "")),
+        "regulator_summary":       str(exp.get("technical_explanation", "")),
+        "top_features":            [],
+    } if exp else None
+
+    # metadata (DecisionMetadata — fill all required fields)
+    processing_ms = float(raw.get("processing_time_ms", 0))
+    metadata = {
+        "processing_time_ms": processing_ms,
+        "model_version":      "2.0.0",
+        "decision_id":        application_id,  # required, no schema default
+        "short_circuited":    bool(raw.get("metadata", {}).get("short_circuit", False)),
+    }
+
+    return {
+        "decision":         decision,
+        "decision_reason":  str(raw.get("decision_reason", "")),
+        "confidence_score": float(raw.get("confidence_score", 0.0)),
+        "risk_assessment":  risk_assessment,
+        "compliance_result":compliance_result,
+        "xai_report":       xai_report,
+        "metadata":         metadata,
+        "loan_eligible":    bool(raw.get("loan_eligible", False)),
+        "selected_model":   str(raw.get("selected_model", "none")),
+    }
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────
+
+def _safe_float(v, default=0.0):
+    try:    return float(v) if v is not None else default
+    except: return default
+
+def _safe_int(v, default=0):
+    try:    return int(v) if v is not None else default
+    except: return default
 
 def _extract_violations(result: dict) -> list:
-    """Pull normalised violation dicts from the orchestrator result."""
-    violations = []
-    compliance = result.get("compliance_result", {})
+    out = []
+    for v in result.get("compliance_result", {}).get("hard_violations", []):
+        out.append(v if isinstance(v, dict) else vars(v))
+    for v in result.get("compliance_result", {}).get("soft_violations", []):
+        out.append(v if isinstance(v, dict) else vars(v))
+    return out
 
-    # Hard violations (from HardConstraintResult)
-    for v in compliance.get("violations", []):
-        if isinstance(v, dict):
-            violations.append(v)
-        elif hasattr(v, "__dict__"):
-            violations.append(v.__dict__)
-
-    # Soft violations
-    for v in compliance.get("soft_violations", []):
-        if isinstance(v, dict):
-            violations.append(v)
-        elif hasattr(v, "__dict__"):
-            violations.append(v.__dict__)
-
-    return violations
-
-
-def _build_db_payload(
-    application_id: str,
-    request_data: dict,
-    result: dict,
-    llm_provider: str,
-) -> dict:
-    """Extract scalar fields from the orchestrator result for the DB row."""
-    decision_str  = str(result.get("decision", "UNKNOWN")).upper()
-    confidence    = _safe_float(result.get("confidence_score", result.get("confidence", 0)))
-    model_used    = str(result.get("selected_model", result.get("model_used", "unknown")))
-
-    risk_block    = result.get("risk_assessment", {})
-    risk_score    = _safe_float(risk_block.get("risk_score_10", risk_block.get("risk_score", 0)))
-    risk_grade    = str(risk_block.get("grade", risk_block.get("risk_grade", "UNKNOWN")))
-
-    comp_block        = result.get("compliance_result", {})
-    is_compliant      = bool(comp_block.get("is_compliant", False))
-    compliance_score  = _safe_float(comp_block.get("compliance_score", 0))
-    hard_violations   = len([
-        v for v in comp_block.get("violations", [])
-        if isinstance(v, dict) and v.get("severity") == "violation"
-    ])
-
+def _build_db_payload(app_id, req_data, result, llm_provider):
+    ra = result.get("risk_assessment", {})
+    cr = result.get("compliance_result", {})
     return dict(
-        application_id   = application_id,
-        decision         = decision_str,
-        confidence       = confidence,
-        model_used       = model_used,
-        risk_score       = risk_score,
-        risk_grade       = risk_grade,
-        compliance_status= "PASS" if is_compliant else "FAIL",
-        compliance_score = compliance_score,
-        hard_violations  = hard_violations,
-        loan_type        = str(request_data.get("loan_type", "unknown")),
-        requested_amount = _safe_float(request_data.get("requested_amount_inr", 0)),
-        bureau_score     = _safe_int(request_data.get("bureau_score", 0)),
-        foir_pct         = _safe_float(request_data.get("foir_total_obligations_pct", 0)),
-        raw_request      = request_data,
+        application_id   = app_id,
+        decision         = str(result.get("decision", "UNKNOWN")).upper(),
+        confidence       = _safe_float(result.get("confidence_score")),
+        model_used       = str(result.get("selected_model", "unknown")),
+        risk_score       = _safe_float(ra.get("risk_score_10")),
+        risk_grade       = str(ra.get("grade", "UNKNOWN")),
+        compliance_status= "PASS" if cr.get("is_compliant") else "FAIL",
+        compliance_score = _safe_float(cr.get("compliance_score")),
+        hard_violations  = len(cr.get("hard_violations", [])),
+        loan_type        = str(req_data.get("loan_type", "unknown")),
+        requested_amount = _safe_float(req_data.get("requested_amount_inr")),
+        bureau_score     = _safe_int(req_data.get("bureau_score")),
+        foir_pct         = _safe_float(req_data.get("foir_total_obligations_pct")),
+        raw_request      = req_data,
         raw_response     = result,
         llm_provider     = llm_provider,
     )
 
 
-# ---------------------------------------------------------------------------
-# Main endpoint
-# ---------------------------------------------------------------------------
+# ── Main endpoint ─────────────────────────────────────────────────────────
 
 @router.post(
     "/evaluate",
-    response_model     = FinalDecisionResponse,
-    status_code        = status.HTTP_200_OK,
-    summary            = "Evaluate a loan application",
-    description        = (
+    response_model  = FinalDecisionResponse,
+    status_code     = status.HTTP_200_OK,
+    summary         = "Evaluate a loan application",
+    description     = (
         "Runs the full agentic pipeline:\n"
-        "1. Unified preprocessing\n"
+        "1. Preprocessing\n"
         "2. Hard-constraint guardrail (short-circuit on violations)\n"
-        "3. RAG-powered soft compliance check\n"
+        "3. RAG soft compliance (Groq + Chroma Cloud)\n"
         "4. Risk scoring\n"
-        "5. Final decision + SHAP/LIME explanations\n\n"
+        "5. Decision + SHAP/LIME explanations\n\n"
         "Every evaluation is persisted to Neon Postgres for audit."
     ),
     responses={
@@ -153,116 +190,76 @@ def _build_db_payload(
     },
 )
 async def evaluate_loan_application(
-    request_body : LoanApplicationRequest,
-    request      : Request,
-    db           : Session = Depends(get_db),
+    request_body: LoanApplicationRequest,
+    request:      Request,
+    db:           Session = Depends(get_db),
 ) -> FinalDecisionResponse:
-    """
-    Evaluate a loan application and persist the result to Neon Postgres.
 
-    The DB write is fire-and-forget inside a try/except so a DB hiccup
-    never blocks the applicant from getting their decision.
-    """
-
-    # ── 1. Generate a stable application ID ──────────────────────────────
     application_id = f"LOAN-{uuid.uuid4().hex[:12].upper()}"
-    logger.info("▶ Evaluating  application_id=%s  loan_type=%s  bureau=%s",
-                application_id,
-                request_body.loan_type,
-                request_body.bureau_score)
+    logger.info("▶ [%s] loan_type=%s bureau=%s", application_id,
+                request_body.loan_type, request_body.bureau_score)
 
-    # ── 2. Convert Pydantic model → plain dict for agents ─────────────────
     application_data = request_body.model_dump()
-    application_data["application_id"] = application_id   # propagate to orchestrator
+    application_data["application_id"] = application_id
 
-    # ── 3. Determine active LLM provider for telemetry ────────────────────
-    import os
     llm_provider = (
-        "groq"      if os.getenv("GROQ_API_KEY")      else
-        "openai"    if os.getenv("OPENAI_API_KEY")     else
-        "anthropic" if os.getenv("ANTHROPIC_API_KEY")  else
+        "groq"   if os.getenv("GROQ_API_KEY")  else
+        "openai" if os.getenv("OPENAI_API_KEY") else
         "mock"
     )
 
-    # ── 4. Run orchestrator (CPU-bound — offload to thread pool) ──────────
+    # ── 1. Run orchestrator ───────────────────────────────────────────────
     try:
-        orchestrator = _get_orchestrator()
-        loop   = asyncio.get_event_loop()
-        result: dict = await loop.run_in_executor(
-            None,
-            orchestrator.evaluate_application,
-            application_data,
+        orch = _get_orchestrator()
+        loop = asyncio.get_event_loop()
+        raw: dict = await loop.run_in_executor(
+            None, orch.evaluate_application, application_data
         )
     except ValueError as exc:
-        logger.warning("Validation error for %s: %s", application_id, exc)
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid application data: {exc}",
-        )
+        raise HTTPException(status_code=400, detail=f"Invalid application data: {exc}")
     except Exception as exc:
-        logger.error("Pipeline error for %s: %s", application_id, exc, exc_info=True)
+        logger.error("Pipeline error [%s]: %s", application_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Evaluation pipeline failed: {exc}")
+
+    # ── 2. Normalise → FinalDecisionResponse ─────────────────────────────
+    try:
+        normalised = _normalize_to_schema(raw, application_id)
+        response   = FinalDecisionResponse(**normalised)
+    except Exception as exc:
+        logger.error("Schema normalisation failed [%s]: %s  raw_keys=%s",
+                     application_id, exc, list(raw.keys()))
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Evaluation pipeline failed: {exc}",
+            status_code=500,
+            detail=f"Response formatting failed: {exc}",
         )
 
-    # ── 5. Persist to Neon Postgres (non-blocking best-effort) ────────────
+    # ── 3. Persist to Neon (best-effort, never blocks response) ──────────
     try:
-        payload    = _build_db_payload(application_id, application_data, result, llm_provider)
-        violations = _extract_violations(result)
-        log_entry  = log_decision(
-            db         = db,
-            violations = violations,
-            processing_ms = _safe_int(result.get("processing_time_ms", 0)),
+        payload   = _build_db_payload(application_id, application_data, raw, llm_provider)
+        log_entry = log_decision(
+            db=db,
+            violations=_extract_violations(raw),
+            processing_ms=_safe_int(raw.get("processing_time_ms", 0)),
             **payload,
         )
-        logger.info("✅ Persisted  application_id=%s  db_row_id=%s  decision=%s",
+        logger.info("✅ Persisted [%s] row=%s decision=%s",
                     application_id, log_entry.id, payload["decision"])
     except Exception as db_exc:
-        # DB failure must NOT break the response — log and continue
-        logger.error("⚠️  DB persist failed for %s: %s (decision still returned)",
-                     application_id, db_exc)
+        logger.error("⚠️  DB persist failed [%s]: %s", application_id, db_exc)
 
-    # ── 6. Inject application_id into metadata before serialising ─────────
-    if isinstance(result.get("metadata"), dict):
-        result["metadata"]["application_id"] = application_id
-    elif hasattr(result.get("metadata"), "__dict__"):
-        result["metadata"].application_id = application_id
-
-    logger.info("◀ Completed  application_id=%s  decision=%s  confidence=%.2f",
-                application_id,
-                result.get("decision", "?"),
-                _safe_float(result.get("confidence_score", result.get("confidence", 0))))
-
-    # ── 7. Serialise and return ────────────────────────────────────────────
-    try:
-        return FinalDecisionResponse(**result)
-    except Exception as exc:
-        logger.error("Response serialisation failed for %s: %s", application_id, exc)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Decision completed but response formatting failed.",
-        )
+    logger.info("◀ [%s] decision=%s confidence=%.2f",
+                application_id, response.decision, response.confidence_score)
+    return response
 
 
-# ---------------------------------------------------------------------------
-# Decision history endpoint (Streamlit dashboard / audit panel)
-# ---------------------------------------------------------------------------
+# ── Audit endpoints ───────────────────────────────────────────────────────
 
-@router.get(
-    "/history",
-    summary     = "Recent loan decisions",
-    description = "Returns the 50 most recent decisions from Neon Postgres.",
-    tags        = ["Audit"],
-)
+@router.get("/history", summary="Recent loan decisions", tags=["Audit"])
 async def get_decision_history(
-    limit : int     = 50,
-    db    : Session = Depends(get_db),
+    limit: int = 50, db: Session = Depends(get_db)
 ) -> Dict[str, Any]:
-    """Paginated audit log for the Streamlit dashboard."""
     from utils.db_utils import LoanDecisionLog
     from sqlalchemy import desc
-
     try:
         rows = (
             db.query(LoanDecisionLog)
@@ -270,53 +267,26 @@ async def get_decision_history(
             .limit(min(limit, 200))
             .all()
         )
-        records = [
+        return {"count": len(rows), "decisions": [
             {
-                "id":                row.id,
-                "application_id":   row.application_id,
-                "timestamp":        row.timestamp.isoformat() if row.timestamp else None,
-                "decision":         row.decision,
-                "confidence":       row.confidence,
-                "risk_score":       row.risk_score,
-                "risk_grade":       row.risk_grade,
-                "compliance_status": row.compliance_status,
-                "loan_type":        row.loan_type,
-                "requested_amount": row.requested_amount,
-                "bureau_score":     row.bureau_score,
-                "foir_pct":         row.foir_pct,
-                "llm_provider":     row.llm_provider,
-                "processing_ms":    row.processing_ms,
+                "id": r.id, "application_id": r.application_id,
+                "timestamp": r.timestamp.isoformat() if r.timestamp else None,
+                "decision": r.decision, "confidence": r.confidence,
+                "risk_score": r.risk_score, "risk_grade": r.risk_grade,
+                "compliance_status": r.compliance_status,
+                "loan_type": r.loan_type, "bureau_score": r.bureau_score,
+                "llm_provider": r.llm_provider, "processing_ms": r.processing_ms,
             }
-            for row in rows
-        ]
-        return {"count": len(records), "decisions": records}
-
+            for r in rows
+        ]}
     except Exception as exc:
-        logger.error("History query failed: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Decision history unavailable.",
-        )
+        raise HTTPException(status_code=503, detail="Decision history unavailable.")
 
 
-# ---------------------------------------------------------------------------
-# Aggregate stats endpoint (Streamlit dashboard)
-# ---------------------------------------------------------------------------
-
-@router.get(
-    "/stats",
-    summary     = "Aggregate decision statistics",
-    description = "Approval rates, average risk scores, and counts from Neon.",
-    tags        = ["Audit"],
-)
+@router.get("/stats", summary="Aggregate decision statistics", tags=["Audit"])
 async def get_stats(db: Session = Depends(get_db)) -> Dict[str, Any]:
-    """Live aggregate stats from the Neon Postgres audit table."""
     from utils.db_utils import get_decision_stats
     try:
         return get_decision_stats(db)
     except Exception as exc:
-        logger.error("Stats query failed: %s", exc)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Statistics unavailable.",
-        )
+        raise HTTPException(status_code=503, detail="Statistics unavailable.")
