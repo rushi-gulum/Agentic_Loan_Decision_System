@@ -13,6 +13,7 @@ rest of the system never needs to know which backend is active.
 
 import os
 import re
+import sys
 import logging
 import warnings
 from typing import Optional
@@ -20,6 +21,39 @@ from typing import Optional
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Stub out opentelemetry gRPC exporter BEFORE chromadb imports it.
+# chromadb 1.1.x imports opentelemetry-exporter-otlp-proto-grpc at package
+# level even when telemetry is disabled.  On Windows machines with AppControl
+# policies the grpc/_cython/cygrpc.pyd DLL is blocked, causing ImportError.
+# This stub satisfies every attribute access without touching any DLL.
+# ---------------------------------------------------------------------------
+import sys as _sys, types as _types
+
+class _NullStub:
+    """Returns a no-op callable for any attribute access."""
+    def __getattr__(self, name):
+        return _NullStub()
+    def __call__(self, *a, **kw):
+        return _NullStub()
+    def __init_subclass__(cls, **kw):
+        pass
+
+_GRPC_STUBS = [
+    "opentelemetry.exporter.otlp.proto.grpc",
+    "opentelemetry.exporter.otlp.proto.grpc.trace_exporter",
+    "opentelemetry.exporter.otlp.proto.grpc._log_exporter",
+    "opentelemetry.exporter.otlp.proto.grpc.metric_exporter",
+]
+for _mod_name in _GRPC_STUBS:
+    if _mod_name not in _sys.modules:
+        _stub = _types.ModuleType(_mod_name)
+        # Pre-populate symbols chromadb actually imports by name
+        _stub.OTLPSpanExporter    = _NullStub
+        _stub.OTLPLogExporter     = _NullStub
+        _stub.OTLPMetricExporter  = _NullStub
+        _sys.modules[_mod_name]   = _stub
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -38,24 +72,20 @@ def get_chroma_client():
       • Chroma Cloud  (if CHROMA_CLOUD_API_KEY + CHROMA_CLOUD_TENANT are set)
       • Local disk    (fallback, always works in dev)
 
-    NOTE: chromadb.CloudClient was introduced in chroma 0.5+.
-    We guard the import so the app degrades gracefully on older installs.
+    Uses chromadb.CloudClient (available in chromadb >= 1.x) which handles
+    the auth headers and endpoint routing automatically.
     """
-    api_key = os.getenv("CHROMA_CLOUD_API_KEY", "")
-    tenant  = os.getenv("CHROMA_CLOUD_TENANT", "")
+    api_key  = os.getenv("CHROMA_CLOUD_API_KEY", "")
+    tenant   = os.getenv("CHROMA_CLOUD_TENANT", "")
     database = os.getenv("CHROMA_CLOUD_DATABASE", "rbi_guidelines")
 
     if api_key and tenant:
         try:
             import chromadb
-            client = chromadb.HttpClient(
-                host="api.trychroma.com",
-                ssl=True,
-                headers={
-                    "x-chroma-token": api_key,
-                    "X-Chroma-Tenant": tenant,
-                    "X-Chroma-Database": database,
-                },
+            client = chromadb.CloudClient(
+                tenant   = tenant,
+                database = database,
+                api_key  = api_key,
             )
             # ping to confirm connectivity
             client.heartbeat()
@@ -127,19 +157,15 @@ def _get_langchain_vectorstore():
             import chromadb
             from langchain_chroma import Chroma as LCChroma
 
-            http_client = chromadb.HttpClient(
-                host="api.trychroma.com",
-                ssl=True,
-                headers={
-                    "x-chroma-token": api_key,
-                    "X-Chroma-Tenant": tenant,
-                    "X-Chroma-Database": database,
-                },
+            cloud_client = chromadb.CloudClient(
+                tenant   = tenant,
+                database = database,
+                api_key  = api_key,
             )
             return LCChroma(
-                client=http_client,
-                collection_name=COLLECTION_NAME,
-                embedding_function=embedder,
+                client            = cloud_client,
+                collection_name   = COLLECTION_NAME,
+                embedding_function= embedder,
             )
         except Exception as exc:
             logger.warning("⚠️  LangChain Chroma Cloud failed (%s) — using local", exc)

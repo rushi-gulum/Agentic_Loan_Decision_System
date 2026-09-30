@@ -63,3 +63,26 @@ uploads/
 *.crt
 secret.txt
 config.json
+
+# --- Cloud deployment artifacts (generated at runtime) ---
+chroma_db/
+data/embeddings/
+data/processed/
+data/local_loan_decisions.db
+
+# --- HuggingFace ONNX model cache ---
+~/.cache/chroma/
+
+# --- Streamlit secrets (use Streamlit Cloud dashboard instead) ---
+.streamlit/secrets.toml
+
+# --- pytest ---
+.pytest_cache/
+htmlcov/
+.coverage
+
+# --- Temporary dev scripts ---
+check_system.py
+_test_*.py
+test_phase*.py
+test_api_simple.py

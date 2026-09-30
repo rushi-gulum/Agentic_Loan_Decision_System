@@ -35,25 +35,56 @@ logger = logging.getLogger(__name__)
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 def _build_engine():
-    """Create the SQLAlchemy engine with the right settings per environment."""
-    if DATABASE_URL and "neon.tech" in DATABASE_URL:
-        logger.info("☁️  Connecting to Neon.tech Postgres")
-        return create_engine(
-            DATABASE_URL,
-            connect_args={"sslmode": "require"},
-            pool_pre_ping=True,          # handle Neon cold-start reconnects
-            pool_recycle=300,            # recycle connections every 5 min
-            echo=False,
-        )
+    """
+    Create the SQLAlchemy engine with the right settings per environment.
 
-    if DATABASE_URL and DATABASE_URL.startswith("postgresql"):
-        logger.info("🐘 Connecting to external Postgres")
-        return create_engine(DATABASE_URL, pool_pre_ping=True, echo=False)
+    Driver priority for Postgres:
+      1. psycopg2   — fastest, needs C extension (may be blocked by AppControl)
+      2. pg8000     — pure-Python fallback, no DLL, works everywhere
+    SQLite is used when DATABASE_URL is empty (local dev without any keys).
+    """
+    if DATABASE_URL and ("neon.tech" in DATABASE_URL or DATABASE_URL.startswith("postgresql")):
+        import ssl as _ssl
+        from urllib.parse import urlparse, urlencode, parse_qs, urlunparse
 
-    # Local fallback — SQLite (no psycopg2 needed for dev)
+        _ctx = _ssl.create_default_context()
+
+        for driver, connect_args in [
+            ("psycopg2", {"sslmode": "require"}),
+            ("pg8000",   {"ssl_context": _ctx, "timeout": 10}),
+        ]:
+            try:
+                url = DATABASE_URL
+                if "+" not in url.split("://")[0]:
+                    url = url.replace("postgresql://", f"postgresql+{driver}://", 1)
+
+                # pg8000 cannot handle ?sslmode= in the URL — strip it
+                if driver == "pg8000":
+                    p  = urlparse(url)
+                    qs = {k: v for k, v in parse_qs(p.query).items() if k != "sslmode"}
+                    url = urlunparse(p._replace(query=urlencode(qs, doseq=True)))
+
+                eng = create_engine(
+                    url,
+                    connect_args=connect_args,
+                    pool_pre_ping=True,
+                    pool_recycle=300,
+                    echo=False,
+                )
+                # Probe with a real connection — confirms credentials work
+                with eng.connect() as conn:
+                    conn.execute(__import__("sqlalchemy").text("SELECT 1"))
+                logger.info("☁️  Neon Postgres connected  driver=%s", driver)
+                return eng
+            except Exception as exc:
+                logger.debug("Driver %s failed: %s", driver, exc)
+
+        logger.warning("⚠️  All Postgres drivers failed — using SQLite fallback")
+
+    # Local fallback — SQLite (zero dependencies)
     sqlite_path = os.getenv("SQLITE_PATH", "./data/local_loan_decisions.db")
     os.makedirs(os.path.dirname(sqlite_path), exist_ok=True)
-    logger.warning("💾 DATABASE_URL not set — falling back to SQLite at %s", sqlite_path)
+    logger.warning("💾 Using SQLite fallback at %s", sqlite_path)
     return create_engine(
         f"sqlite:///{sqlite_path}",
         connect_args={"check_same_thread": False},

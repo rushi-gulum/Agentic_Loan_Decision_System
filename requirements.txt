@@ -23,7 +23,8 @@ plotly>=5.17.0
 
 # ── Database — Neon.tech Serverless Postgres ───────────────────────────────
 sqlalchemy>=2.0.0              # ORM (engine, session, declarative_base)
-psycopg2-binary>=2.9.9         # Postgres driver with SSL support
+psycopg2-binary>=2.9.9         # Postgres driver with SSL support (Linux/Mac)
+pg8000>=1.31.0                 # Pure-Python Postgres driver fallback (Windows / no-DLL)
 alembic>=1.13.0                # DB migrations (run: alembic upgrade head)
 
 # ── AI Agents & LLM Orchestration ─────────────────────────────────────────
