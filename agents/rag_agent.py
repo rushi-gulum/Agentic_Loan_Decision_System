@@ -62,44 +62,62 @@ MODEL_NAME       = "sentence-transformers/all-MiniLM-L6-v2"
 LOCAL_CHROMA_DIR = os.getenv("CHROMA_PERSIST_DIRECTORY", "./data/embeddings")
 COLLECTION_NAME  = os.getenv("CHROMA_COLLECTION_NAME", "rbi_guidelines")
 
+# Module-level cache — created lazily on first query, not at import time
+_chroma_client  = None
+_chroma_mode    = None
+
 # ---------------------------------------------------------------------------
 # 1.  Chroma client factory — Cloud or Local
 # ---------------------------------------------------------------------------
 
 def get_chroma_client():
     """
-    Return a chromadb client routed to either:
-      • Chroma Cloud  (if CHROMA_CLOUD_API_KEY + CHROMA_CLOUD_TENANT are set)
-      • Local disk    (fallback, always works in dev)
-
-    Uses chromadb.CloudClient (available in chromadb >= 1.x) which handles
-    the auth headers and endpoint routing automatically.
+    Return a chromadb client — Cloud if keys present, else local PersistentClient.
+    Cached in module globals so import cost is paid only once per process.
+    Import of chromadb is deferred here (not at module level) to save startup RAM.
     """
+    global _chroma_client, _chroma_mode
+    if _chroma_client is not None:
+        return _chroma_client, _chroma_mode
+
+    import sys, types
+    # gRPC stub (Windows AppControl + any env where cygrpc DLL is missing)
+    class _NullStub:
+        def __getattr__(self, n): return _NullStub()
+        def __call__(self, *a, **k): return _NullStub()
+    for _m in [
+        "opentelemetry.exporter.otlp.proto.grpc",
+        "opentelemetry.exporter.otlp.proto.grpc.trace_exporter",
+        "opentelemetry.exporter.otlp.proto.grpc._log_exporter",
+        "opentelemetry.exporter.otlp.proto.grpc.metric_exporter",
+    ]:
+        if _m not in sys.modules:
+            _s = types.ModuleType(_m)
+            _s.OTLPSpanExporter = _NullStub
+            _s.OTLPLogExporter  = _NullStub
+            _s.OTLPMetricExporter = _NullStub
+            sys.modules[_m] = _s
+
+    import chromadb
     api_key  = os.getenv("CHROMA_CLOUD_API_KEY", "")
     tenant   = os.getenv("CHROMA_CLOUD_TENANT", "")
     database = os.getenv("CHROMA_CLOUD_DATABASE", "rbi_guidelines")
 
     if api_key and tenant:
         try:
-            import chromadb
-            client = chromadb.CloudClient(
-                tenant   = tenant,
-                database = database,
-                api_key  = api_key,
-            )
-            # ping to confirm connectivity
+            client = chromadb.CloudClient(tenant=tenant, database=database, api_key=api_key)
             client.heartbeat()
-            logger.info("☁️  Connected to Chroma Cloud (tenant=%s, db=%s)", tenant, database)
-            return client, "cloud"
+            logger.info("☁️  Connected to Chroma Cloud (tenant=%s)", tenant)
+            _chroma_client, _chroma_mode = client, "cloud"
+            return _chroma_client, _chroma_mode
         except Exception as exc:
             logger.warning("⚠️  Chroma Cloud unavailable (%s) — falling back to local", exc)
 
-    # Local persistent fallback
-    import chromadb
     os.makedirs(LOCAL_CHROMA_DIR, exist_ok=True)
     client = chromadb.PersistentClient(path=LOCAL_CHROMA_DIR)
     logger.info("💾 Connected to local Chroma at %s", LOCAL_CHROMA_DIR)
-    return client, "local"
+    _chroma_client, _chroma_mode = client, "local"
+    return _chroma_client, _chroma_mode
 
 
 def get_vector_store():

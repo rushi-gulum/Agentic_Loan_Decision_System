@@ -32,5 +32,5 @@ products:
     BORROWER_NWC_MIN: 0.05
     BANK_FINANCE_PCT: 0.20
 global:
-  AML_PEP_POLICY: {pep_requires: "enhanced_due_diligence", action_if_unresolved: "escalate"}
+  AML_PEP_POLICY: {pep_requires: "decline", action_if_unresolved: "decline"}
   NEGATIVE_LIST_ACTION: "decline"

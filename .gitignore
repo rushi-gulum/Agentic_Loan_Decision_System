@@ -56,6 +56,9 @@ uploads/
 *.db
 *.pickle
 *.pkl
+*.xlsx
+*.csv
+.agents/
 
 # --- Environment / Secrets ---
 *.key

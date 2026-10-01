@@ -47,61 +47,29 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Ordered startup:
-      1. Download models from HuggingFace Hub (skips cached files)
-      2. CREATE tables in Neon Postgres (idempotent)
-      3. Verify Chroma Cloud / local vector-store
-    Shutdown: graceful, nothing to flush.
+    Minimal startup — only initialise the Postgres tables.
+    Everything else (HF model download, Chroma, LLM) is lazy-loaded on the
+    first /evaluate request.  This keeps the 512 MB Render free-tier happy.
     """
+    logger.info("🚀 Starting Agentic Loan Decision API (lazy-load mode)")
 
-    # ── Step 1: Model artefacts ──────────────────────────────────────────
-    logger.info("━━━ [1/3] Model artefacts ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    try:
-        import asyncio as _aio
-        from utils.model_loader import download_models, check_model_health
-        loop = _aio.get_event_loop()
-        result = await loop.run_in_executor(None, download_models)
-        health = check_model_health()
-        if result["success"]:
-            logger.info("✅ Models ready  (repo=%s  downloaded=%d  cached=%d)",
-                        result["repo"], len(result["downloaded"]), len(result["skipped"]))
-        else:
-            logger.error("❌ Some required models missing: %s", result["failed"])
-        app.state.model_health = health
-    except Exception as exc:
-        logger.error("Model loader failed: %s", exc)
-        app.state.model_health = {"status": "error", "error": str(exc)}
-
-    # ── Step 2: Neon Postgres ────────────────────────────────────────────
-    logger.info("━━━ [2/3] Database (Neon) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    # ── DB tables only — fast, no network except Neon TCP handshake ──────
     try:
         from utils.db_utils import init_db
-        init_db()                         # CREATE TABLE IF NOT EXISTS
-        db_status = "healthy"
+        init_db()
+        app.state.db_status = "healthy"
         logger.info("✅ Neon tables initialised")
     except Exception as exc:
-        db_status = f"error: {exc}"
+        app.state.db_status = f"error: {exc}"
         logger.error("❌ DB init failed: %s", exc)
-    app.state.db_status = db_status
 
-    # ── Step 3: Chroma vector-store ──────────────────────────────────────
-    logger.info("━━━ [3/3] Vector store (Chroma) ━━━━━━━━━━━━━━━━━━━━━━━━")
-    try:
-        from agents.rag_agent import check_rag_health
-        rag_health = check_rag_health()
-        logger.info("✅ Chroma %s  mode=%s  docs=%s",
-                    rag_health["status"],
-                    rag_health.get("mode", "?"),
-                    rag_health.get("document_count", "?"))
-    except Exception as exc:
-        rag_health = {"status": "error", "error": str(exc)}
-        logger.error("❌ RAG health check failed: %s", exc)
-    app.state.rag_health = rag_health
+    # Mark all heavy components as "pending" — loaded on first request
+    app.state.model_health  = {"status": "pending", "note": "loaded on first request"}
+    app.state.rag_health    = {"status": "pending", "note": "loaded on first request"}
 
-    logger.info("🚀 API ready  env=%s", os.getenv("ENVIRONMENT", "development"))
+    logger.info("✅ API ready (models will load on first /evaluate call)")
     yield
 
-    # Shutdown
     logger.info("🛑 Shutting down Agentic Loan Decision API")
 
 
@@ -189,39 +157,28 @@ async def health_check(request: Request) -> Dict[str, Any]:
       - vector_store : Chroma Cloud / local (RAG soft compliance)
     """
 
-    # ── 1. Models — check the artefacts /evaluate actually loads ─────────
+    # ── 1. Models — check artefacts on disk (no loading into RAM) ────────
     try:
         from utils.model_loader import check_model_health
         mh = check_model_health()
-
-        # Determine which required artefacts are missing
         required_keys = [
             "preprocessor.joblib",
-            "loan_approval_model.joblib",
             "explainer/shap_explainer.joblib",
             "explainer/lime_explainer.joblib",
         ]
-        missing = [
-            k for k in required_keys
-            if not mh.get("artefacts", {}).get(k, {}).get("present", False)
-        ]
-
-        if missing:
-            model_health = {
-                "status":  "degraded",
-                "missing": missing,
-                "detail":  "Run: python pipeline/build_artifacts.py",
-            }
-        else:
-            model_health = {
-                "status":   "healthy",
-                "artefacts": {
-                    k: mh["artefacts"][k]
-                    for k in required_keys
-                    if k in mh.get("artefacts", {})
-                },
-                "hf_repo":  mh.get("hf_repo", "local"),
-            }
+        has_model = (
+            mh.get("artefacts", {}).get("loan_approval_model_xgb.joblib", {}).get("present", False)
+            or mh.get("artefacts", {}).get("loan_approval_model.joblib", {}).get("present", False)
+        )
+        missing = [k for k in required_keys
+                   if not mh.get("artefacts", {}).get(k, {}).get("present", False)]
+        if not has_model:
+            missing.append("loan_approval_model_xgb.joblib")
+        model_health = {
+            "status":  "degraded" if missing else "healthy",
+            "missing": missing,
+            "hf_repo": mh.get("hf_repo", "local"),
+        }
     except Exception as exc:
         model_health = {"status": "error", "error": str(exc)}
 

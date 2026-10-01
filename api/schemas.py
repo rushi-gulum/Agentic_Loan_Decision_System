@@ -80,7 +80,12 @@ class LoanApplicationRequest(BaseModel):
     model_config = ConfigDict(
         str_strip_whitespace=True,
         validate_assignment=True,
-        extra='forbid'  # Strict mode - no extra fields allowed
+        extra='allow'
+    )
+    
+    application_id: Optional[str] = Field(
+        default=None,
+        description="Optional client-provided application ID"
     )
     
     # ========================================================================

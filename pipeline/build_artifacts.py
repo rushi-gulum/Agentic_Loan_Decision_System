@@ -2,32 +2,24 @@
 """
 pipeline/build_artifacts.py
 ============================
-Deterministic ML artefact builder.
+Deterministic ML artefact & dataset builder.
 
 What this script produces
 -------------------------
-models/preprocessor.joblib          sklearn Pipeline (fitted)
-models/scaler.joblib                 StandardScaler (fitted, legacy compat)
-models/loan_approval_model.joblib    LogisticRegression (interpretable default)
-models/explainer/shap_explainer.joblib  shap.Explainer (real, fitted)
-models/explainer/lime_explainer.joblib  LimeTabularExplainer (real, fitted)
-data/processed/X_train.csv
-data/processed/y_train.csv
-data/processed/training_data_raw.csv
-
-Design principles
------------------
-- sklearn only — no Keras/TensorFlow dependency (avoids torch DLL issues on Windows)
-- LogisticRegression for interpretability; XGBoost added if xgboost is installed
-- SHAP LinearExplainer for logistic regression (fast, no background-sample cost)
-- LIME TabularExplainer on the full training set
-- Deterministic: np.random.seed(42) throughout
-- Idempotent: safe to re-run; overwrites previous artefacts
-- The Keras .h5 file is NOT produced here; xai_agent uses .joblib model instead
+loan_approval_model.xlsx              Full 40,000 rows x 26 columns Excel dataset
+data/processed/training_data_raw.csv  Full 40,000 rows raw application records
+data/processed/X_train.csv            40,000 rows preprocessed feature matrix
+data/processed/y_train.csv            40,000 rows labels
+models/preprocessor.joblib            sklearn Pipeline (fitted)
+models/scaler.joblib                  StandardScaler (fitted, legacy compat)
+models/loan_approval_model.joblib      LogisticRegression (interpretable default)
+models/explainer/shap_explainer.joblib   shap.Explainer (real, fitted)
+models/explainer/lime_explainer.joblib   LimeTabularExplainer manifest (real, fitted)
 
 Run
 ---
     python pipeline/build_artifacts.py
+    python pipeline/build_artifacts.py --samples 40000
 """
 
 import os
@@ -52,6 +44,7 @@ ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
 from utils.preprocessing import LoanPreprocessor, LoanApplicationSchema
+from utils.explain_utils import CoeffExplainer
 
 # ── directories ──────────────────────────────────────────────────────────
 DIRS = [
@@ -64,25 +57,6 @@ for d in DIRS:
 # ── random seed ───────────────────────────────────────────────────────────
 SEED = 42
 np.random.seed(SEED)
-
-
-class CoeffExplainer:
-    """
-    Module-level (picklable) SHAP-compatible explainer for LogisticRegression.
-    Used as fallback when shap/numba DLLs are blocked (Windows AppControl).
-    Implements .shap_values() via coefficient × feature-value product.
-    On Linux/Render the real shap.LinearExplainer is used instead.
-    """
-    def __init__(self, model, feature_names):
-        self.coef_         = model.coef_[0]
-        self.feature_names = list(feature_names)
-        self.fitted_       = True
-
-    def shap_values(self, X):
-        if hasattr(X, "values"):
-            X = X.values
-        X = np.array(X, dtype=float)
-        return (X * self.coef_).tolist()
 
 
 FEATURE_NAMES = [
@@ -99,49 +73,60 @@ FEATURE_NAMES = [
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# 1. Training data generator
+# 1. Training data generator (40,000 records)
 # ─────────────────────────────────────────────────────────────────────────
 
-def _generate_training_data(n: int = 2000) -> List[Dict[str, Any]]:
+def _generate_training_data(n: int = 40000) -> List[Dict[str, Any]]:
     """
     Generate realistic synthetic loan applications with deterministic seed.
-    Approval labels use rule-based logic (no randomness beyond data generation),
-    so the dataset is reproducible across runs.
+    Produces comprehensive credit profiles with realistic credit scoring,
+    risk parameters, and regulatory boundary adherence.
     """
     rng = np.random.RandomState(SEED)
 
-    loan_types    = ["housing", "personal", "vehicle", "gold", "personal"]  # personal weighted up
-    genders       = ["Male", "Female", "Other"]
-    interest_types= ["Fixed", "Floating"]
-    ovd_types     = ["Aadhaar", "PAN", "Passport", "Driving Licence"]
-    pin_codes     = [110001, 400001, 560001, 600001, 700001, 411001, 500001, 380001]
+    loan_types     = ["housing", "personal", "vehicle", "gold", "personal"]  # personal weighted up
+    genders        = ["Male", "Female", "Other"]
+    interest_types = ["Fixed", "Floating"]
+    ovd_types      = ["Aadhaar", "PAN", "Passport", "Driving Licence", "Voter ID"]
+    kyc_modes      = ["Video KYC", "eKYC", "CKYC", "Offline"]
+    pin_codes      = [110001, 400001, 560001, 600001, 700001, 411001, 500001, 380001, 302001, 226001]
 
     base_date = datetime(2023, 1, 1)
     records   = []
 
     for i in range(n):
         age          = int(rng.randint(21, 65))
-        bureau       = int(np.clip(650 + age * 2 + rng.normal(0, 50), 300, 900))
-        income       = max(15_000, int(25_000 + age * 800 + (bureau - 650) * 50 + rng.normal(0, 8_000)))
+        # Bureau score: 300 to 900, centered around 680
+        bureau       = int(np.clip(670 + age * 1.2 + rng.normal(0, 65), 300, 900))
+        # Monthly income: INR 15,000 to 500,000+ (log-normal distribution)
+        income       = max(15_000, int(np.exp(rng.normal(10.8, 0.45))))
         loan_type    = rng.choice(loan_types)
 
-        # loan amounts
-        multipliers = {"housing": (30, 80, 5_000_000), "vehicle": (8, 25, 2_000_000),
-                       "gold": (3, 10, 800_000), "personal": (3, 15, 1_000_000)}
-        lo, hi, cap  = multipliers.get(loan_type, (3, 15, 1_000_000))
-        requested    = min(int(income * rng.uniform(lo, hi)), cap)
-        sanctioned   = int(requested * rng.uniform(0.75, 1.0))
+        # Multipliers based on loan product
+        multipliers = {
+            "housing": (30, 80, 7_500_000),
+            "vehicle": (8, 25, 2_500_000),
+            "gold":    (3, 10, 1_000_000),
+            "personal":(2, 12, 1_500_000)
+        }
+        lo, hi, cap = multipliers.get(loan_type, (2, 12, 1_500_000))
+        requested   = min(int(income * rng.uniform(lo, hi)), cap)
+        sanctioned  = int(requested * rng.uniform(0.80, 1.0))
 
-        # obligations & FOIR
-        existing_obl = int(income * rng.uniform(0.05, 0.38))
-        rate_ranges  = {"housing": (8.5, 12.0), "vehicle": (9.0, 14.0),
-                        "gold": (11.0, 16.0), "personal": (12.0, 24.0)}
-        lo_r, hi_r   = rate_ranges.get(loan_type, (12.0, 24.0))
-        rate         = round(rng.uniform(lo_r, hi_r), 2)
+        # Obligations & FOIR
+        existing_obl = int(income * rng.uniform(0.05, 0.35))
+        rate_ranges = {
+            "housing": (8.25, 11.5),
+            "vehicle": (9.0, 14.0),
+            "gold":    (10.5, 15.5),
+            "personal":(12.0, 22.0)
+        }
+        lo_r, hi_r = rate_ranges.get(loan_type, (12.0, 22.0))
+        rate       = round(rng.uniform(lo_r, hi_r), 2)
 
-        tenure_ranges = {"housing": (120, 300), "vehicle": (36, 84)}
-        t_lo, t_hi   = tenure_ranges.get(loan_type, (12, 60))
-        tenure       = int(rng.randint(t_lo, t_hi))
+        tenure_ranges = {"housing": (120, 300), "vehicle": (36, 84), "gold": (12, 36)}
+        t_lo, t_hi    = tenure_ranges.get(loan_type, (12, 60))
+        tenure        = int(rng.randint(t_lo, t_hi))
 
         mr  = rate / 1200
         emi = (sanctioned * mr * (1 + mr)**tenure) / ((1 + mr)**tenure - 1) if mr > 0 else sanctioned / tenure
@@ -150,31 +135,58 @@ def _generate_training_data(n: int = 2000) -> List[Dict[str, Any]]:
         # property / LTV
         prop_val  = None
         ltv_ratio = None
-        if loan_type in ("housing", "vehicle"):
-            prop_val  = int(sanctioned / rng.uniform(0.65, 0.90))
+        if loan_type in ("housing", "vehicle", "gold"):
+            haircut   = rng.uniform(0.65, 0.88) if loan_type == "housing" else rng.uniform(0.70, 0.90)
+            prop_val  = int(sanctioned / haircut)
             ltv_ratio = round(min(sanctioned / prop_val, 1.0), 3)
 
         # dates
         app_date      = base_date + timedelta(days=int(rng.randint(0, 365)))
-        sanction_date = app_date  + timedelta(days=int(rng.randint(3, 25)))
+        sanction_date = app_date  + timedelta(days=int(rng.randint(2, 20)))
 
-        # approval: deterministic rule (not random), reproducible
-        approved = (
-            bureau >= 650
-            and foir  <= 70
-            and (not bool(rng.choice([True, False], p=[0.02, 0.98])))  # PEP
-            and income >= 20_000
+        # PEP & KFS flags
+        pep_flag     = bool(rng.choice([True, False], p=[0.02, 0.98]))
+        kfs_provided = bool(rng.choice([True, False], p=[0.96, 0.04]))
+
+        # Realistic Credit Scoring Decision Logic
+        hard_reject = (
+            bureau < 580
+            or foir > 75.0
+            or income < 18_000
+            or (ltv_ratio is not None and ltv_ratio > 0.92)
+            or (pep_flag and rng.uniform(0, 1) < 0.80)
+            or (not kfs_provided and rng.uniform(0, 1) < 0.70)
         )
 
+        if hard_reject:
+            approved = 0
+        else:
+            # Credit propensity logit
+            z = (
+                (bureau - 650.0) / 60.0
+                - (foir - 40.0) / 15.0
+                + (np.log(income) - np.log(30000)) * 1.4
+                - (0.8 if foir > 55.0 else 0.0)
+                - (1.2 if ltv_ratio and ltv_ratio > 0.80 else 0.0)
+            )
+            prob = 1.0 / (1.0 + np.exp(-np.clip(z, -5.0, 5.0)))
+            approved = int(rng.uniform(0, 1) < prob)
+
+        # Default probability for approved loans
+        default_12m = 0
+        if approved:
+            p_def = 1.0 / (1.0 + np.exp(-(-2.8 - (bureau - 650) / 80.0 + (foir - 40) / 20.0)))
+            default_12m = int(rng.uniform(0, 1) < p_def)
+
         records.append({
-            "application_id":                  f"APP_{i+1:05d}",
+            "application_id":                  f"APP_{i+1:06d}",
             "application_date":                app_date.strftime("%Y-%m-%d"),
             "sanction_date":                   sanction_date.strftime("%Y-%m-%d"),
             "loan_type":                       loan_type,
             "age_years":                       age,
-            "gender":                          rng.choice(genders, p=[0.60, 0.35, 0.05]),
+            "gender":                          rng.choice(genders, p=[0.58, 0.38, 0.04]),
             "pin_code":                        rng.choice(pin_codes),
-            "pep_flag":                        bool(rng.choice([True, False], p=[0.02, 0.98])),
+            "pep_flag":                        pep_flag,
             "bureau_score":                    bureau,
             "monthly_income_inr":              income,
             "existing_monthly_obligations_inr":existing_obl,
@@ -186,32 +198,28 @@ def _generate_training_data(n: int = 2000) -> List[Dict[str, Any]]:
             "processing_fee_inr":              max(500, int(requested * 0.01)),
             "other_charges_inr":               int(rng.randint(200, 2_000)),
             "apr_pct":                         round(rate + rng.uniform(0.1, 1.5), 2),
-            "kfs_provided":                    bool(rng.choice([True, False], p=[0.95, 0.05])),
+            "kfs_provided":                    kfs_provided,
             "proposed_emi_inr":                round(emi, 2),
             "foir_total_obligations_pct":      round(foir, 2),
             "ovd_type":                        rng.choice(ovd_types),
-            "kyc_mode":                        rng.choice(["Video KYC", "Offline", "eKYC", "CKYC"]),
+            "kyc_mode":                        rng.choice(kyc_modes),
             "property_value_inr":              prop_val,
             "ltv_ratio":                       ltv_ratio,
             "target_approved":                 int(approved),
-            "target_default_12m":              0,
+            "target_default_12m":              int(default_12m),
         })
 
     return records
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# 2. Preprocessing
+# 2. Preprocessing & Dataset Export
 # ─────────────────────────────────────────────────────────────────────────
 
 def _build_preprocessing(records: List[Dict[str, Any]]) -> Tuple[np.ndarray, pd.Series]:
-    """Fit LoanPreprocessor, return (X_array, y_series)."""
-    import pandas as pd
-
+    """Fit LoanPreprocessor, return (X_array, y_series) and export datasets."""
     preprocessor = LoanPreprocessor()
 
-    # Convert to DataFrame so NaN-filled columns (property_value_inr, ltv_ratio)
-    # are handled uniformly by the pipeline's DerivedFeatureTransformer.
     df_raw = pd.DataFrame(records)
     df_raw["property_value_inr"] = df_raw["property_value_inr"].fillna(0)
     df_raw["ltv_ratio"]          = df_raw["ltv_ratio"].fillna(0)
@@ -231,13 +239,43 @@ def _build_preprocessing(records: List[Dict[str, Any]]) -> Tuple[np.ndarray, pd.
     joblib.dump(scaler, str(ROOT / "models" / "scaler.joblib"))
     logger.info("scaler.joblib saved (StandardScaler)")
 
-    df_raw.to_csv(ROOT / "data" / "processed" / "training_data_raw.csv", index=False)
+    # 1. Raw applications CSV
+    raw_path = ROOT / "data" / "processed" / "training_data_raw.csv"
+    df_raw.to_csv(raw_path, index=False)
+    logger.info("training_data_raw.csv saved (%d rows)", len(df_raw))
 
+    # 2. Processed feature matrices
     y = pd.Series([r["target_approved"] for r in records], name="target_approved")
     df_X = pd.DataFrame(X, columns=FEATURE_NAMES[:X.shape[1]])
     df_X.to_csv(ROOT / "data" / "processed" / "X_train.csv", index=False)
     y.to_csv(ROOT / "data" / "processed" / "y_train.csv", index=False)
-    logger.info("X_train.csv  y_train.csv  saved")
+    logger.info("X_train.csv and y_train.csv saved (%d rows)", len(df_X))
+
+    # 3. 26-column loan_approval_model dataset (25 features + target)
+    df_excel = df_X.copy()
+    df_excel["target"] = y.values
+    logger.info("Exporting loan_approval_model datasets (%d rows x %d columns) ...",
+                len(df_excel), df_excel.shape[1])
+
+    # Save Excel at primary locations
+    excel_paths = [
+        ROOT / "loan_approval_model.xlsx",
+        ROOT / "data" / "loan_approval_model.xlsx",
+        ROOT / "data" / "processed" / "loan_approval_model.xlsx",
+    ]
+    for p in excel_paths:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        df_excel.to_excel(p, index=False)
+        logger.info("Saved %s (%.1f MB)", str(p.relative_to(ROOT)), p.stat().st_size / (1024 * 1024))
+
+    # Save companion CSV for rapid reading
+    csv_paths = [
+        ROOT / "data" / "loan_approval_model.csv",
+        ROOT / "data" / "processed" / "loan_approval_model.csv",
+    ]
+    for cp in csv_paths:
+        df_excel.to_csv(cp, index=False)
+        logger.info("Saved %s (%.1f MB)", str(cp.relative_to(ROOT)), cp.stat().st_size / (1024 * 1024))
 
     return X, y
 
@@ -295,28 +333,19 @@ def _train_model(X: np.ndarray, y: pd.Series):
 def _build_explainers(model, X: np.ndarray, feature_names: List[str]):
     """
     Fit and save real SHAP and LIME explainers.
-
-    SHAP: Uses shap.explainers.Linear which does NOT require numba.
-          Falls back to a lightweight correlation-based explainer if shap
-          itself is blocked (Windows AppControl DLL issue with numba).
-    LIME: LimeTabularExplainer fitted on the full training set.
+    SHAP: Uses shap.LinearExplainer. Falls back to CoeffExplainer.
+    LIME: LimeTabularExplainer fitted on a representative 5,000 sample background.
     """
     # ── SHAP ─────────────────────────────────────────────────────────────
     try:
-        # Import only the linear sub-module — avoids numba via _clustering
-        import importlib
-        shap_linear = importlib.import_module("shap.explainers.linear")
-        LinearExplainer = shap_linear.Linear
-
-        masker         = importlib.import_module("shap.maskers").Independent(X, max_samples=200)
-        shap_explainer = LinearExplainer(model, masker, feature_names=feature_names)
-
+        import shap
+        shap_explainer = shap.LinearExplainer(model, X[:200], feature_names=feature_names)
         sample_shap = shap_explainer.shap_values(X[:3])
         assert sample_shap is not None
         logger.info("SHAP LinearExplainer verified  sample.shape=%s", np.array(sample_shap).shape)
 
     except Exception as exc:
-        logger.warning("SHAP import failed (%s) — using coefficient-based fallback", exc)
+        logger.warning("SHAP LinearExplainer failed (%s) — using CoeffExplainer fallback", exc)
         shap_explainer = CoeffExplainer(model, feature_names)
         logger.info("Coefficient-based fallback explainer ready (%d features)", len(feature_names))
 
@@ -325,11 +354,11 @@ def _build_explainers(model, X: np.ndarray, feature_names: List[str]):
     logger.info("shap_explainer.joblib  saved  (%d bytes)", shap_path.stat().st_size)
 
     # ── LIME ─────────────────────────────────────────────────────────────
-    # LimeTabularExplainer contains internal lambdas that are not picklable.
-    # Save a serialisable manifest; load_lime_explainer() reconstructs it.
     from lime.lime_tabular import LimeTabularExplainer
+    # Use 5,000 background sample for fast inference and compact serialization
+    lime_bg = X[:5000] if len(X) > 5000 else X
     lime_manifest = {
-        "training_data": X.tolist(),
+        "training_data": lime_bg.tolist(),
         "feature_names": feature_names,
         "class_names":   ["Rejected", "Approved"],
         "mode":          "classification",
@@ -339,7 +368,7 @@ def _build_explainers(model, X: np.ndarray, feature_names: List[str]):
 
     # Smoke-test: reconstruct and explain first row
     lime_explainer = LimeTabularExplainer(
-        training_data         = X,
+        training_data         = lime_bg,
         feature_names         = feature_names,
         class_names           = ["Rejected", "Approved"],
         mode                  = "classification",
@@ -375,17 +404,19 @@ def _validate():
         "models/explainer/lime_explainer.joblib": "lime explainer",
         "data/processed/X_train.csv":             "training features",
         "data/processed/y_train.csv":             "training labels",
+        "data/processed/training_data_raw.csv":   "raw applications CSV",
+        "loan_approval_model.xlsx":               "40,000 row Excel dataset",
     }
 
     all_ok = True
     print("\n" + "─" * 55)
-    print("  ARTEFACT VALIDATION")
+    print("  ARTEFACT & DATASET VALIDATION")
     print("─" * 55)
     for path, label in required.items():
         full = ROOT / path
         if full.exists():
             size_kb = full.stat().st_size // 1024
-            print(f"  ✅  {label:<32}  {size_kb} KB")
+            print(f"  ✅  {label:<32}  {size_kb:>8} KB")
         else:
             print(f"  ❌  {label:<32}  MISSING: {path}")
             all_ok = False
@@ -401,7 +432,6 @@ def _validate():
         "requested_amount_inr": 500_000, "tenure_months": 48,
         "interest_rate_annual_pct": 12.5, "foir_total_obligations_pct": 35.0,
         "gender": "Male", "interest_type": "Fixed",
-        # Ensure all fields needed by pipeline are present
         "pin_code": 400001, "pep_flag": False, "kfs_provided": True,
         "existing_monthly_obligations_inr": 10_000,
         "sanctioned_amount_inr": 500_000, "processing_fee_inr": 5_000,
@@ -415,8 +445,8 @@ def _validate():
     assert out.shape[0] == 1, f"Preprocessor transform shape unexpected: {out.shape}"
     print(f"  ✅  preprocessor.transform()   shape={out.shape}")
 
-    import shap
-    shap_exp = joblib.load(str(ROOT / "models" / "explainer" / "shap_explainer.joblib"))
+    from utils.model_loader import load_shap_explainer
+    shap_exp = load_shap_explainer()
     assert hasattr(shap_exp, "shap_values"), "SHAP explainer missing .shap_values()"
     sv = shap_exp.shap_values(out)
     assert sv is not None
@@ -428,7 +458,7 @@ def _validate():
     print(f"  ✅  model.predict_proba()       shape={proba.shape}  p_approve={proba[0,1]:.3f}")
 
     print("─" * 55)
-    print("  ALL ARTEFACTS VALID ✅")
+    print("  ALL ARTEFACTS & DATASETS VALID ✅")
     print("─" * 55 + "\n")
 
 
@@ -436,15 +466,15 @@ def _validate():
 # 6. Main
 # ─────────────────────────────────────────────────────────────────────────
 
-def main(n_samples: int = 2000):
+def main(n_samples: int = 40000):
     print("\n" + "═" * 55)
-    print("  AGENTIC LOAN DECISION — ARTEFACT BUILDER")
+    print(f"  AGENTIC LOAN DECISION — ARTEFACT & DATASET BUILDER ({n_samples:,} rows)")
     print("═" * 55)
 
     logger.info("Generating %d training samples ...", n_samples)
     records = _generate_training_data(n_samples)
 
-    logger.info("Fitting preprocessing pipeline ...")
+    logger.info("Fitting preprocessing pipeline & exporting datasets ...")
     X, y = _build_preprocessing(records)
 
     logger.info("Training classification model ...")
@@ -456,16 +486,18 @@ def main(n_samples: int = 2000):
 
     _validate()
 
-    print("  Next steps:")
-    print("    python pipeline/ingest_rag.py   (if not done)")
-    print("    make api | .\\setup.ps1 api")
-    print("    make ui  | .\\setup.ps1 ui\n")
+    print("  Dataset and Model Artefacts Ready:")
+    print("    • loan_approval_model.xlsx (40,000 rows x 26 columns)")
+    print("    • data/processed/training_data_raw.csv (40,000 rows)")
+    print("    • data/processed/X_train.csv & y_train.csv (40,000 rows)")
+    print("    • models/loan_approval_model.joblib")
+    print("    • models/preprocessor.joblib\n")
 
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--samples", type=int, default=2000)
+    parser.add_argument("--samples", type=int, default=40000)
     parser.add_argument("--dry-run",  action="store_true")
     args = parser.parse_args()
 

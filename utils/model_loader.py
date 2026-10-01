@@ -43,10 +43,11 @@ EXPLAINER_DIR = MODEL_DIR / "explainer"
 ARTEFACT_MANIFEST = [
     ("preprocessor.joblib",              MODEL_DIR / "preprocessor.joblib",              True),
     ("scaler.joblib",                    MODEL_DIR / "scaler.joblib",                    True),
-    ("loan_approval_model.joblib",       MODEL_DIR / "loan_approval_model.joblib",       True),   # sklearn LR (primary)
+    ("loan_approval_model.joblib",       MODEL_DIR / "loan_approval_model.joblib",       True),   # sklearn LR
+    ("loan_approval_model_xgb.joblib",   MODEL_DIR / "loan_approval_model_xgb.joblib",  True),   # XGBoost primary
     ("explainer/shap_explainer.joblib",  EXPLAINER_DIR / "shap_explainer.joblib",        True),
     ("explainer/lime_explainer.joblib",  EXPLAINER_DIR / "lime_explainer.joblib",        True),
-    ("loan_approval_model_xgb.joblib",   MODEL_DIR / "loan_approval_model_xgb.joblib",  False),  # optional XGB
+    ("xgboost_optimization_report.json", Path("data/processed/xgboost_optimization_report.json"), False),
     ("loan_approval_model.h5",           MODEL_DIR / "loan_approval_model.h5",           False),  # optional legacy Keras
 ]
 
@@ -196,7 +197,13 @@ def load_shap_explainer():
         download_models()
     if not path.exists():
         raise FileNotFoundError(f"shap_explainer.joblib not found at {path}.")
-    import joblib
+    import joblib, sys
+    try:
+        from utils.explain_utils import CoeffExplainer
+        if hasattr(sys.modules.get("__main__"), "__dict__"):
+            sys.modules["__main__"].CoeffExplainer = CoeffExplainer
+    except Exception:
+        pass
     return joblib.load(path)
 
 
@@ -232,30 +239,37 @@ def load_lime_explainer():
     )
 
 
-def load_approval_model():
+def load_approval_model(model_type: Optional[str] = None):
     """
-    Load the fitted sklearn classification model.
-    Prefers loan_approval_model.joblib (sklearn LR).
-    Falls back to loan_approval_model_xgb.joblib if available.
-    Raises FileNotFoundError if neither is present.
+    Load the fitted classification model.
+    If model_type == 'xgb': loads loan_approval_model_xgb.joblib.
+    If model_type == 'lr': loads loan_approval_model.joblib.
+    By default, prioritizes the optimized XGBoost model (85.4% accuracy, 0.85+ AUC)
+    and falls back to Logistic Regression.
     """
     import joblib
-    primary  = MODEL_DIR / "loan_approval_model.joblib"
-    fallback = MODEL_DIR / "loan_approval_model_xgb.joblib"
+    primary_xgb = MODEL_DIR / "loan_approval_model_xgb.joblib"
+    fallback_lr = MODEL_DIR / "loan_approval_model.joblib"
 
-    for path in (primary, fallback):
+    pref = (model_type or os.getenv("DEFAULT_MODEL", "xgb")).lower()
+    if pref in ("lr", "interpretable", "logistic"):
+        candidate_paths = [fallback_lr, primary_xgb]
+    else:
+        candidate_paths = [primary_xgb, fallback_lr]
+
+    for path in candidate_paths:
         if path.exists():
             logger.info("Loading model from %s", path)
             return joblib.load(path), path.name
 
-    # Try downloading
+    # Try downloading if missing
     download_models()
-    for path in (primary, fallback):
+    for path in candidate_paths:
         if path.exists():
             return joblib.load(path), path.name
 
     raise FileNotFoundError(
-        "No sklearn model found. Run: python pipeline/build_artifacts.py"
+        "No sklearn/xgboost model found. Run: python pipeline/train_xgboost_optimized.py"
     )
 
 

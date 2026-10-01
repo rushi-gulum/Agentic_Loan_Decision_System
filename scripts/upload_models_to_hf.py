@@ -35,7 +35,8 @@ from huggingface_hub import HfApi, create_repo
 api = HfApi(token=TOKEN)
 
 # ── Step 1: Create repo if it doesn't exist ───────────────────────────────
-print(f"📦 Ensuring repo exists: {REPO_ID}")
+# ── Step 1: Create repo if it doesn't exist ───────────────────────────────
+print(f"[INFO] Ensuring repo exists: {REPO_ID}")
 try:
     create_repo(
         repo_id   = REPO_ID,
@@ -44,9 +45,9 @@ try:
         exist_ok  = True,    # No error if it already exists
         token     = TOKEN,
     )
-    print(f"   ✅ Repo ready: https://huggingface.co/{REPO_ID}")
+    print(f"   [OK] Repo ready: https://huggingface.co/{REPO_ID}")
 except Exception as e:
-    print(f"   ⚠️  create_repo warning (may already exist): {e}")
+    print(f"   [WARN] create_repo warning (may already exist): {e}")
 
 # ── Step 2: Files to upload ───────────────────────────────────────────────
 ROOT = Path(__file__).parent.parent
@@ -55,8 +56,10 @@ ARTEFACTS = [
     (ROOT / "models" / "preprocessor.joblib",            "preprocessor.joblib"),
     (ROOT / "models" / "scaler.joblib",                  "scaler.joblib"),
     (ROOT / "models" / "loan_approval_model.joblib",     "loan_approval_model.joblib"),
+    (ROOT / "models" / "loan_approval_model_xgb.joblib", "loan_approval_model_xgb.joblib"),
     (ROOT / "models" / "explainer" / "shap_explainer.joblib", "explainer/shap_explainer.joblib"),
     (ROOT / "models" / "explainer" / "lime_explainer.joblib", "explainer/lime_explainer.joblib"),
+    (ROOT / "data" / "processed" / "xgboost_optimization_report.json", "xgboost_optimization_report.json"),
 ]
 
 # Optional — only upload if it exists (large legacy file)
@@ -65,13 +68,13 @@ if optional.exists():
     ARTEFACTS.append((optional, "loan_approval_model.h5"))
 
 # ── Step 3: Upload ────────────────────────────────────────────────────────
-print(f"\n⬆️  Uploading {len(ARTEFACTS)} artefacts to {REPO_ID} ...")
-print("─" * 55)
+print(f"\n[INFO] Uploading {len(ARTEFACTS)} artefacts to {REPO_ID} ...")
+print("-" * 55)
 
 success = 0
 for local_path, hub_path in ARTEFACTS:
     if not local_path.exists():
-        print(f"   ⚠️  SKIP (not found): {local_path.name}")
+        print(f"   [SKIP] (not found): {local_path.name}")
         continue
 
     size_kb = local_path.stat().st_size // 1024
@@ -84,12 +87,12 @@ for local_path, hub_path in ARTEFACTS:
             token           = TOKEN,
             commit_message  = f"Upload {hub_path}",
         )
-        print(f"   ✅ {hub_path:<48}  {size_kb} KB")
+        print(f"   [OK] {hub_path:<48}  {size_kb} KB")
         success += 1
     except Exception as e:
-        print(f"   ❌ FAILED {hub_path}: {e}")
+        print(f"   [FAILED] {hub_path}: {e}")
 
-print("─" * 55)
-print(f"\n{'✅ All' if success == len(ARTEFACTS) else f'{success}/{len(ARTEFACTS)}'} artefacts uploaded.")
-print(f"🔗 https://huggingface.co/{REPO_ID}")
+print("-" * 55)
+print(f"\n{'[ALL OK]' if success == len(ARTEFACTS) else f'{success}/{len(ARTEFACTS)}'} artefacts uploaded.")
+print(f"URL: https://huggingface.co/{REPO_ID}")
 print("\nNext: set HUGGINGFACE_REPO_ID in Render environment variables.")

@@ -197,12 +197,12 @@ HARD CONSTRAINT STATUS:
                 try:
                     soft_violations.append(SoftViolation(**violation_data))
                 except Exception as e:
-                    print(f"⚠️ Warning: Invalid soft violation format: {e}")
+                    print(f"[WARN] Invalid soft violation format: {e}")
             
             return soft_violations
         
     except Exception as e:
-        print(f"⚠️ Warning: Soft compliance evaluation failed: {e}")
+        print(f"[WARN] Soft compliance evaluation failed: {e}")
     
     return []  # Safe fallback
 
@@ -259,7 +259,7 @@ Write a professional compliance explanation:
             return str(explanation).strip()
             
     except Exception as e:
-        print(f"⚠️ Warning: LLM explanation generation failed: {e}")
+        print(f"[WARN] LLM explanation generation failed: {e}")
         # Safe fallback
         if overall_compliant:
             return f"Application meets all regulatory requirements for {hard_result.loan_type} loans. All hard constraints satisfied with {len(hard_result.rules_applied)} rules verified."
@@ -286,7 +286,7 @@ def check_rbi_compliance(applicant: Dict[str, Any], guidelines: Dict[str, Any]) 
     """
     
     # STEP 1: Evaluate hard constraints (deterministic)
-    print("🔒 Checking hard constraints...")
+    print("[INFO] Checking hard constraints...")
     hard_result = evaluate_hard_compliance(applicant)
     
     # STEP 2: Evaluate soft constraints (LLM-based, only if guidelines available)
@@ -294,13 +294,13 @@ def check_rbi_compliance(applicant: Dict[str, Any], guidelines: Dict[str, Any]) 
     rag_guidelines_used = []
     
     if guidelines and guidelines.get("feature_guidelines"):
-        print("📋 Checking soft constraints with RAG guidelines...")
+        print("[INFO] Checking soft constraints with RAG guidelines...")
         soft_violations = evaluate_soft_compliance(applicant, guidelines, hard_result)
         
         # Extract guideline keys that were used
         rag_guidelines_used = list(guidelines.get("feature_guidelines", {}).keys())
     else:
-        print("⚠️ No RAG guidelines provided, skipping soft constraint evaluation")
+        print("[INFO] No RAG guidelines provided, skipping soft constraint evaluation")
     
     # STEP 3: Determine overall compliance
     # Fail if hard constraints fail OR if significant soft violations found
@@ -323,7 +323,7 @@ def check_rbi_compliance(applicant: Dict[str, Any], guidelines: Dict[str, Any]) 
     compliance_score = max(0.0, base_score - violation_penalty - warning_penalty - soft_penalty)
     
     # STEP 5: Generate explanation
-    print("📝 Generating compliance explanation...")
+    print("[INFO] Generating compliance explanation...")
     explanation = format_compliance_explanation(hard_result, soft_violations, overall_compliant)
     
     # STEP 6: Create comprehensive result
@@ -339,7 +339,7 @@ def check_rbi_compliance(applicant: Dict[str, Any], guidelines: Dict[str, Any]) 
         rules_applied=hard_result.rules_applied
     )
     
-    print(f"✅ Compliance check complete: {'PASS' if overall_compliant else 'FAIL'}")
+    print(f"[OK] Compliance check complete: {'PASS' if overall_compliant else 'FAIL'}")
     
     # Return as dictionary for compatibility with existing orchestrator
     return {

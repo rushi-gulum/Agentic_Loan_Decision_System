@@ -9,6 +9,7 @@ numpy>=1.24.0,<2.0.0
 pandas>=2.0.0
 scikit-learn>=1.3.0,<2.0.0
 joblib>=1.3.0
+xgboost>=2.0.0
 
 # ── Web Framework & API ────────────────────────────────────────────────────
 fastapi>=0.104.0
@@ -18,11 +19,11 @@ httpx>=0.25.0
 requests>=2.28.0
 python-multipart>=0.0.6
 
-# ── UI (frontend uses streamlit_app_cloud.py on Streamlit Community Cloud) ─
-# Streamlit is NOT needed on Render — it runs the Streamlit frontend separately.
-# Comment out streamlit here to keep the Render build lean and fast.
-# streamlit>=1.28.0
-plotly>=5.17.0
+# ── UI — Streamlit runs separately on Streamlit Community Cloud ────────────
+# DO NOT install streamlit on the Render API server — it consumes ~200 MB.
+# The frontend (frontend/streamlit_app_cloud.py) is deployed independently.
+# streamlit>=1.28.0   # only needed locally or on Streamlit Cloud
+plotly>=5.17.0        # used by Streamlit frontend, harmless to install
 
 # ── Database — Neon.tech Serverless Postgres ───────────────────────────────
 sqlalchemy>=2.0.0
@@ -40,19 +41,24 @@ langchain-community>=0.0.20
 
 # ── RAG & Vector Database — Chroma Cloud ───────────────────────────────────
 chromadb>=1.0.0                # CloudClient API requires 1.x
-sentence-transformers>=2.2.0
+# sentence-transformers pulls in torch (~500 MB) — NOT needed on Render.
+# Chroma's built-in ONNX embedder (onnxruntime) is used instead.
+# sentence-transformers>=2.2.0
 pypdf>=3.17.0
 
 # ── Model Storage — Hugging Face Hub ───────────────────────────────────────
 huggingface_hub>=0.20.0
 
 # ── Explainable AI ─────────────────────────────────────────────────────────
-shap>=0.43.0
-lime>=0.2.0
+# shap and lime are heavy (pull in numba, scikit-image, matplotlib).
+# On Render free tier we use the CoeffExplainer (no shap import needed at runtime)
+# and skip LIME. Uncomment if you upgrade to a paid Render instance.
+# shap>=0.43.0
+# lime>=0.2.0
 
 # ── Fallback LLMs (optional — system works with Groq alone) ────────────────
-openai>=1.0.0
-# anthropic>=0.7.0             # uncomment if you want Anthropic fallback
+# openai>=1.0.0      # uncomment if you want OpenAI fallback
+# anthropic>=0.7.0   # uncomment if you want Anthropic fallback
 
 # ── Security & Environment ─────────────────────────────────────────────────
 python-dotenv>=1.0.0

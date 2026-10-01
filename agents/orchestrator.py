@@ -90,17 +90,19 @@ class LoanDecisionOrchestrator:
                 logger.info("[%s] SHORT-CIRCUIT: %d hard violations",
                             application_id, len(hard_result.violations))
                 return self._rejection_response(
-                    application_id = application_id,
-                    violations     = [v.model_dump() for v in hard_result.violations],
-                    rules_applied  = hard_result.rules_applied,
-                    processing_ms  = self._elapsed_ms(start_time),
+                    application_id   = application_id,
+                    violations       = [v.model_dump() for v in hard_result.violations],
+                    rules_applied    = hard_result.rules_applied,
+                    processing_ms    = self._elapsed_ms(start_time),
+                    application_data = application_data,
+                    preprocessed     = preprocessed,
                 )
 
             # ── Stage 3: Soft compliance (RAG + Groq) ────────────────────
             logger.info("[%s] Stage 3: Soft compliance", application_id)
             try:
                 guidelines      = retrieve_feature_guidelines(application_data)
-                compliance_dict = check_rbi_compliance(preprocessed, guidelines)
+                compliance_dict = check_rbi_compliance(application_data, guidelines)
             except Exception as exc:
                 logger.warning("[%s] Soft compliance error (non-fatal): %s", application_id, exc)
                 compliance_dict = self._compliance_pass_fallback(hard_result)
@@ -370,6 +372,8 @@ Paragraph 2: Technical risk and compliance analysis."""
             "explanations": {
                 "customer_explanation":  xai_dict.get("user_explanation", ""),
                 "technical_explanation": xai_dict.get("regulator_explanation", ""),
+                "user_explanation":      xai_dict.get("user_explanation", ""),
+                "regulator_explanation": xai_dict.get("regulator_explanation", ""),
                 "raw_data":              xai_dict.get("raw_data", {}),
             },
 
@@ -384,12 +388,48 @@ Paragraph 2: Technical risk and compliance analysis."""
 
     def _rejection_response(
         self,
-        application_id: str,
-        violations:     List[Dict],
-        rules_applied:  List[str],
-        processing_ms:  int,
+        application_id:   str,
+        violations:       List[Dict],
+        rules_applied:    List[str],
+        processing_ms:    int,
+        application_data: Optional[Dict[str, Any]] = None,
+        preprocessed:     Optional[Any] = None,
     ) -> Dict[str, Any]:
         messages = [v.get("message", "Violation") for v in violations]
+
+        customer_exp = None
+        technical_exp = None
+        raw_xai = {"violations": violations, "rules_applied": rules_applied}
+
+        if application_data is not None:
+            try:
+                from agents.xai_agent import explain_short_circuit_rejection
+                sc_res = explain_short_circuit_rejection(
+                    applicant_data = application_data,
+                    violations     = violations,
+                    rules_applied  = rules_applied,
+                    preprocessed   = preprocessed,
+                )
+                customer_exp = sc_res.get("user_explanation")
+                technical_exp = sc_res.get("regulator_explanation")
+                raw_xai = sc_res.get("raw_data", raw_xai)
+            except Exception as exc:
+                logger.warning("[%s] Short-circuit XAI generation failed: %s", application_id, exc)
+
+        if not customer_exp:
+            customer_exp = (
+                "Your application could not be approved at this time because it does not "
+                "meet one or more mandatory regulatory requirements. "
+                f"Issues: {'; '.join(messages)}. "
+                "Please contact your branch for guidance on resolving these issues."
+            )
+        if not technical_exp:
+            technical_exp = (
+                f"Hard constraint evaluation failed for {len(violations)} rule(s). "
+                f"Rules applied: {', '.join(rules_applied)}. "
+                "Application short-circuited before ML inference."
+            )
+
         return {
             "application_id":   application_id,
             "decision":         "REJECTED",
@@ -421,18 +461,11 @@ Paragraph 2: Technical risk and compliance analysis."""
             "approval_probability": 0.0,
 
             "explanations": {
-                "customer_explanation": (
-                    "Your application could not be approved at this time because it does not "
-                    "meet one or more mandatory regulatory requirements. "
-                    f"Issues: {'; '.join(messages)}. "
-                    "Please contact your branch for guidance on resolving these issues."
-                ),
-                "technical_explanation": (
-                    f"Hard constraint evaluation failed for {len(violations)} rule(s). "
-                    f"Rules applied: {', '.join(rules_applied)}. "
-                    "Application short-circuited before ML inference."
-                ),
-                "raw_data": {"violations": violations, "rules_applied": rules_applied},
+                "customer_explanation":  customer_exp,
+                "technical_explanation": technical_exp,
+                "user_explanation":      customer_exp,
+                "regulator_explanation": technical_exp,
+                "raw_data":              raw_xai,
             },
 
             "metadata": {

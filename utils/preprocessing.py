@@ -20,7 +20,7 @@ try:
     from sklearn.pipeline import Pipeline
     SKLEARN_AVAILABLE = True
 except ImportError:
-    print("⚠️ Warning: scikit-learn not available, using simplified preprocessing")
+    print("Warning: scikit-learn not available, using simplified preprocessing")
     SKLEARN_AVAILABLE = False
     
     # Create dummy base classes for compatibility
@@ -45,16 +45,16 @@ class LoanApplicationSchema(BaseModel):
         extra = 'allow'  # Allow extra fields
         
     # Required fields
-    age_years: int = Field(ge=18, le=100, description="Applicant age in years")
-    bureau_score: int = Field(ge=300, le=900, description="Credit bureau score")
+    age_years: Union[int, float] = Field(ge=18, le=100, description="Applicant age in years")
+    bureau_score: Union[int, float] = Field(ge=300, le=900, description="Credit bureau score")
     monthly_income_inr: float = Field(gt=0, description="Monthly income in INR")
     requested_amount_inr: float = Field(gt=0, description="Requested loan amount in INR")
-    tenure_months: int = Field(ge=6, le=360, description="Loan tenure in months")
+    tenure_months: Union[int, float] = Field(ge=6, le=360, description="Loan tenure in months")
     interest_rate_annual_pct: float = Field(ge=0, le=50, description="Annual interest rate percentage")
     foir_total_obligations_pct: float = Field(ge=0, le=150, description="Fixed Obligation to Income Ratio percentage")  # Increased limit
     
     # Optional fields with defaults
-    pin_code: Optional[int] = Field(default=110001, ge=100000, le=999999, description="6-digit PIN code")
+    pin_code: Optional[Union[int, float]] = Field(default=110001, description="6-digit PIN code")
     pep_flag: bool = Field(default=False, description="Politically Exposed Person flag")
     kfs_provided: bool = Field(default=True, description="Key Fact Statement provided flag")
     existing_monthly_obligations_inr: float = Field(default=0, ge=0, description="Existing monthly obligations in INR")
@@ -234,19 +234,11 @@ class FeatureOrderTransformer(BaseEstimator, TransformerMixin):
         return X[available].values
 
 
-def create_preprocessing_pipeline() -> Union['Pipeline', 'SimplifiedPipeline']:
+def create_preprocessing_pipeline() -> 'SimplifiedPipeline':
     """
-    Create a comprehensive preprocessing pipeline.
-    Uses sklearn Pipeline if available, otherwise falls back to simplified version.
-    
-    Returns:
-        Pipeline or SimplifiedPipeline: A fitted pipeline for preprocessing loan applications.
+    Create a comprehensive 25-feature preprocessing pipeline matching X_train.csv.
     """
-    
-    if SKLEARN_AVAILABLE:
-        return create_sklearn_pipeline()
-    else:
-        return SimplifiedPipeline()
+    return SimplifiedPipeline(scale_numeric=False)
 
 
 def create_sklearn_pipeline() -> 'Pipeline':
@@ -308,9 +300,10 @@ def create_sklearn_pipeline() -> 'Pipeline':
 
 
 class SimplifiedPipeline:
-    """Simplified preprocessing pipeline that doesn't depend on sklearn."""
+    """Simplified preprocessing pipeline that doesn't depend on complex sklearn transformers."""
     
-    def __init__(self):
+    def __init__(self, scale_numeric: bool = False):
+        self.scale_numeric = scale_numeric
         self.feature_order = [
             'age_years', 'pin_code', 'pep_flag', 'bureau_score',
             'monthly_income_inr', 'existing_monthly_obligations_inr',
@@ -329,39 +322,41 @@ class SimplifiedPipeline:
             'other_charges_inr', 'apr_pct', 'proposed_emi_inr', 'foir_total_obligations_pct',
             'property_value_inr', 'ltv_ratio', 'time_to_sanction_days', 'application_month'
         ]
-        self.scaler_params = {}  # Will store mean and std for each feature
+        self.scaler_params = {}
+        self.fitted_ = False
         
     def fit(self, X: pd.DataFrame, y=None):
-        """Fit the simplified pipeline by computing scaling parameters."""
-        # Apply all transformations first
-        X_transformed = self._apply_transformations(X)
-        
-        # Compute scaling parameters for numeric features
-        for col in self.numeric_features:
-            if col in X_transformed.columns:
-                self.scaler_params[col] = {
-                    'mean': X_transformed[col].mean(),
-                    'std': X_transformed[col].std()
-                }
-        
+        """Fit the simplified pipeline by computing scaling parameters if requested."""
+        self.fitted_ = True
+        if self.scale_numeric:
+            X_transformed = self._apply_transformations(X)
+            for col in self.numeric_features:
+                if col in X_transformed.columns:
+                    self.scaler_params[col] = {
+                        'mean': float(X_transformed[col].mean()),
+                        'std': float(X_transformed[col].std())
+                    }
         return self
     
     def transform(self, X: pd.DataFrame) -> np.ndarray:
         """Transform input data using the fitted pipeline."""
-        # Apply all feature transformations
         X_transformed = self._apply_transformations(X)
+        if self.scale_numeric:
+            for col in self.numeric_features:
+                if col in X_transformed.columns and col in self.scaler_params:
+                    mean = self.scaler_params[col]['mean']
+                    std = self.scaler_params[col]['std']
+                    if std > 0:
+                        X_transformed[col] = (X_transformed[col] - mean) / std
         
-        # Apply scaling to numeric features
-        for col in self.numeric_features:
-            if col in X_transformed.columns and col in self.scaler_params:
-                mean = self.scaler_params[col]['mean']
-                std = self.scaler_params[col]['std']
-                if std > 0:  # Avoid division by zero
-                    X_transformed[col] = (X_transformed[col] - mean) / std
-        
-        # Ensure feature order and return as numpy array
+        # Ensure feature order, fill any remaining NaNs, return float32 numpy array
+        for col in self.feature_order:
+            if col not in X_transformed.columns:
+                X_transformed[col] = 0.0
+            else:
+                X_transformed[col] = X_transformed[col].fillna(0.0)
         X_ordered = X_transformed[self.feature_order]
-        return X_ordered.values
+        return X_ordered.values.astype(np.float32)
     
     def fit_transform(self, X: pd.DataFrame, y=None) -> np.ndarray:
         """Fit and transform in one step."""
@@ -371,6 +366,24 @@ class SimplifiedPipeline:
         """Apply all feature engineering transformations."""
         X = X.copy()
         
+        # Provide defaults for missing critical columns
+        if 'interest_type' not in X.columns:
+            X['interest_type'] = 'Fixed'
+        if 'gender' not in X.columns:
+            X['gender'] = 'Male'
+        if 'pin_code' not in X.columns:
+            X['pin_code'] = 110001
+        if 'pep_flag' not in X.columns:
+            X['pep_flag'] = 0
+        if 'kfs_provided' not in X.columns:
+            X['kfs_provided'] = 1
+        if 'existing_monthly_obligations_inr' not in X.columns:
+            X['existing_monthly_obligations_inr'] = 0.0
+        if 'processing_fee_inr' not in X.columns:
+            X['processing_fee_inr'] = 0.0
+        if 'other_charges_inr' not in X.columns:
+            X['other_charges_inr'] = 0.0
+        
         # Handle date features
         if 'application_date' in X.columns and 'sanction_date' in X.columns:
             X['application_date'] = pd.to_datetime(X['application_date'], errors='coerce')
@@ -378,9 +391,11 @@ class SimplifiedPipeline:
             X['time_to_sanction_days'] = (X['sanction_date'] - X['application_date']).dt.days
             X['application_month'] = X['application_date'].dt.month
         else:
-            X['time_to_sanction_days'] = 7  # Default processing time
-            X['application_month'] = datetime.now().month
+            X['time_to_sanction_days'] = X.get('time_to_sanction_days', 7)
+            X['application_month'] = X.get('application_month', datetime.now().month)
         
+        X['time_to_sanction_days'] = X['time_to_sanction_days'].fillna(7)
+        X['application_month'] = X['application_month'].fillna(datetime.now().month)
         X = X.drop(columns=['application_date', 'sanction_date'], errors='ignore')
         
         # Convert boolean columns
@@ -393,35 +408,38 @@ class SimplifiedPipeline:
         if 'ovd_type' in X.columns:
             X['ovd_provided'] = X['ovd_type'].notna().astype(int)
         else:
-            X['ovd_provided'] = 1
+            X['ovd_provided'] = X.get('ovd_provided', 1)
         
         # Handle sanctioned amount
         if 'sanctioned_amount_inr' in X.columns:
-            X['sanctioned_amount_inr'] = X['sanctioned_amount_inr'].fillna(X['requested_amount_inr'])
-        else:
+            X['sanctioned_amount_inr'] = X['sanctioned_amount_inr'].fillna(X.get('requested_amount_inr', 0))
+        elif 'requested_amount_inr' in X.columns:
             X['sanctioned_amount_inr'] = X['requested_amount_inr']
+        else:
+            X['sanctioned_amount_inr'] = 0.0
         
         # Calculate APR if not provided
         if 'apr_pct' not in X.columns or X['apr_pct'].isna().any():
-            X['apr_pct'] = X['apr_pct'].fillna(X['interest_rate_annual_pct'])
+            rate_col = X.get('interest_rate_annual_pct', 10.0)
+            X['apr_pct'] = X['apr_pct'].fillna(rate_col) if 'apr_pct' in X.columns else rate_col
         
         # Calculate EMI if not provided
         if 'proposed_emi_inr' not in X.columns or X['proposed_emi_inr'].isna().any():
             P = X['sanctioned_amount_inr']
-            r = X['interest_rate_annual_pct'] / (12 * 100)
-            n = X['tenure_months']
-            r = r.replace(0, 0.001)
+            rate_col = X.get('interest_rate_annual_pct', 10.0)
+            r = (rate_col / (12 * 100)).replace(0, 0.001)
+            n = X.get('tenure_months', 24)
             emi = (P * r * (1 + r)**n) / ((1 + r)**n - 1)
-            X['proposed_emi_inr'] = X['proposed_emi_inr'].fillna(emi)
+            X['proposed_emi_inr'] = X['proposed_emi_inr'].fillna(emi) if 'proposed_emi_inr' in X.columns else emi
         
         # Handle property value and LTV
         if 'property_value_inr' not in X.columns:
-            X['property_value_inr'] = 0
+            X['property_value_inr'] = 0.0
         if 'ltv_ratio' not in X.columns:
-            X['ltv_ratio'] = 0
+            X['ltv_ratio'] = 0.0
         
-        X['property_value_inr'] = X['property_value_inr'].fillna(0)
-        X['ltv_ratio'] = X['ltv_ratio'].fillna(0)
+        X['property_value_inr'] = X['property_value_inr'].fillna(0.0)
+        X['ltv_ratio'] = X['ltv_ratio'].fillna(0.0)
         
         # Encode interest type
         X['interest_type_encoded'] = X['interest_type'].map({'Fixed': 0, 'Floating': 1}).fillna(0)
@@ -430,19 +448,24 @@ class SimplifiedPipeline:
         for gender_type in ['Female', 'Male', 'Other']:
             X[f'gender_{gender_type}'] = 0
         
-        if 'gender' in X.columns:
-            for idx, gender_value in enumerate(X['gender']):
-                if f'gender_{gender_value}' in X.columns:
-                    X.loc[idx, f'gender_{gender_value}'] = 1
+        for idx in X.index:
+            g_val = str(X.loc[idx, 'gender']) if 'gender' in X.columns else 'Male'
+            col_name = f'gender_{g_val}'
+            if col_name in X.columns:
+                X.loc[idx, col_name] = 1
+            else:
+                X.loc[idx, 'gender_Male'] = 1
         
-        # Drop unnecessary columns
+        # Drop unnecessary raw columns
         drop_cols = ['gender', 'interest_type', 'kyc_mode', 'ovd_type', 'loan_type', 'state']
         X = X.drop(columns=[col for col in drop_cols if col in X.columns], errors='ignore')
         
         # Add missing columns with default values
         for col in self.feature_order:
             if col not in X.columns:
-                X[col] = 0
+                X[col] = 0.0
+            else:
+                X[col] = X[col].fillna(0.0)
         
         return X
 
@@ -460,9 +483,9 @@ class LoanPreprocessor:
         if pipeline_path and joblib.os.path.exists(pipeline_path):
             try:
                 self.pipeline = joblib.load(pipeline_path)
-                print(f"✅ Loaded preprocessing pipeline from {pipeline_path}")
+                print(f"[OK] Loaded preprocessing pipeline from {pipeline_path}")
             except Exception as e:
-                print(f"⚠️ Warning: Could not load pipeline ({e}), creating new one")
+                print(f"[WARN] Warning: Could not load pipeline ({e}), creating new one")
                 self.pipeline = create_preprocessing_pipeline()
         else:
             self.pipeline = create_preprocessing_pipeline()
@@ -489,7 +512,7 @@ class LoanPreprocessor:
             try:
                 LoanApplicationSchema(**sample_row)
             except Exception as e:
-                print(f"⚠️ Warning: Schema validation failed: {e}")
+                print(f"[WARN] Schema validation note: {e}")
         
         self.pipeline.fit(X)
         self.is_fitted = True
@@ -515,7 +538,7 @@ class LoanPreprocessor:
                 validated_data = LoanApplicationSchema(**X)
                 df = pd.DataFrame([validated_data.model_dump()])
             except Exception as e:
-                print(f"⚠️ Schema validation failed: {e}, proceeding without validation")
+                print(f"[WARN] Schema validation note: {e}, proceeding with raw dict")
                 df = pd.DataFrame([X])
         elif isinstance(X, list):
             # Multiple applications
@@ -523,7 +546,7 @@ class LoanPreprocessor:
                 validated_data = [LoanApplicationSchema(**item) for item in X]
                 df = pd.DataFrame([item.model_dump() for item in validated_data])
             except Exception as e:
-                print(f"⚠️ Schema validation failed: {e}, proceeding without validation")
+                print(f"[WARN] Schema validation note: {e}, proceeding with raw list")
                 df = pd.DataFrame(X)
         else:
             # Already a DataFrame
@@ -558,8 +581,24 @@ class LoanPreprocessor:
             raise ValueError("Cannot save unfitted preprocessor. Call fit() first.")
         
         joblib.dump(self.pipeline, filepath)
-        print(f"✅ Preprocessing pipeline saved to {filepath}")
+        print(f"[OK] Preprocessing pipeline saved to {filepath}")
     
+    def get_feature_names(self) -> List[str]:
+        """Return the 25 feature names in exact order."""
+        if hasattr(self.pipeline, "feature_order"):
+            return list(self.pipeline.feature_order)
+        return [
+            'age_years', 'pin_code', 'pep_flag', 'bureau_score',
+            'monthly_income_inr', 'existing_monthly_obligations_inr',
+            'requested_amount_inr', 'sanctioned_amount_inr', 'tenure_months',
+            'interest_rate_annual_pct', 'processing_fee_inr', 'other_charges_inr',
+            'apr_pct', 'kfs_provided', 'proposed_emi_inr',
+            'foir_total_obligations_pct', 'property_value_inr', 'ltv_ratio',
+            'time_to_sanction_days', 'application_month',
+            'interest_type_encoded', 'gender_Female', 'gender_Male', 'gender_Other',
+            'ovd_provided'
+        ]
+
     @classmethod
     def load(cls, filepath: str) -> 'LoanPreprocessor':
         """

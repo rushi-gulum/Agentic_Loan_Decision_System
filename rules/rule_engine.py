@@ -133,6 +133,7 @@ class GlobalRules(BaseModel):
 
 class RuleBase(BaseModel):
     """Complete rule base containing all lending rules."""
+    model_config = {"populate_by_name": True}
     version: str = Field(description="Rule version")
     jurisdiction: str = Field(description="Regulatory jurisdiction")
     products: Dict[str, ProductRules] = Field(description="Product-specific rules")

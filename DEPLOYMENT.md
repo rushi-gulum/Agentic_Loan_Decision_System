@@ -186,7 +186,7 @@ git push origin main
 
 ```bash
 # Health check
-curl https://loan-decision-api.onrender.com/health | python -m json.tool
+curl https://https://loan-decision-api-y23b.onrender.com/health | python -m json.tool
 
 # Deployment topology
 curl https://loan-decision-api.onrender.com/status | python -m json.tool
@@ -223,7 +223,7 @@ curl -X POST https://loan-decision-api.onrender.com/api/v1/evaluate \
 4. Click **Advanced settings → Secrets** and paste:
 
    ```toml
-   API_BASE_URL = "https://loan-decision-api.onrender.com"
+   API_BASE_URL = "https://loan-decision-api-y23b.onrender.com"
    ```
 
 5. Click **Deploy**.  

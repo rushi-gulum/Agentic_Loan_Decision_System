@@ -25,12 +25,12 @@ jobs:
         
     - name: Run tests
       run: |
-        python -m pytest tests/test_rule_engine.py tests/test_risk_agent.py -v
+        python -m pytest tests/test_rule_engine.py tests/test_risk_agent.py tests/test_agents.py tests/test_integration.py -v
         
     - name: Test API health
       run: |
         python -c "from utils.config import config; print('Config OK')"
-        python -c "from utils.llm_utility_cloud import check_llm_health; print('LLM OK')"
+        python -c "from utils.llm_utility import get_llm; print('LLM OK')"
 
   deploy-api:
     needs: test
